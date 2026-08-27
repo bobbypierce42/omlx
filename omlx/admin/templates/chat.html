@@ -774,6 +774,99 @@
         color: var(--text-muted);
     }
 
+    /* VoiceChat operator panel */
+    .voicechat-panel {
+        border: 1px solid var(--border-normal);
+        border-radius: 1rem;
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+        margin-bottom: 0.75rem;
+        overflow: hidden;
+    }
+
+    .voicechat-panel-header {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-height: 2.5rem;
+        padding: 0.5rem 0.75rem;
+        border-bottom: 1px solid var(--border-faint);
+    }
+
+    .voicechat-panel-status {
+        min-width: 0;
+        flex: 1;
+        font-size: 0.75rem;
+        color: var(--text-secondary);
+    }
+
+    .voicechat-panel-body {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.75rem;
+        font-size: 0.8125rem;
+        line-height: 1.5;
+    }
+
+    .voicechat-transcript {
+        display: grid;
+        gap: 0.125rem;
+        min-width: 0;
+    }
+
+    .voicechat-transcript-label {
+        font-size: 0.65rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--text-tertiary);
+    }
+
+    .voicechat-transcript-text {
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+    }
+
+    .voicechat-tool-row {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 0;
+        padding: 0.375rem 0.5rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.5rem;
+        color: var(--text-secondary);
+    }
+
+    .voicechat-tool-name {
+        min-width: 0;
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .voicechat-tool-state {
+        flex-shrink: 0;
+        font-size: 0.7rem;
+        color: var(--text-tertiary);
+    }
+
+    .voicechat-model-card {
+        display: grid;
+        gap: 0.5rem;
+        padding: 0.75rem;
+        border: 1px solid var(--border-faint);
+        border-radius: 0.75rem;
+        background: var(--bg-secondary);
+    }
+
+    .voicechat-model-card-error {
+        overflow-wrap: anywhere;
+        font-size: 0.7rem;
+        color: var(--text-danger);
+    }
+
     /* API Key Modal */
     .api-key-modal.hidden {
         display: none;
@@ -1752,6 +1845,60 @@
                 </button>
             </div>
             <div class="max-w-4xl mx-auto">
+                <div x-show="modelListState === 'loading' && availableModels.length === 0" x-cloak
+                    class="mb-2 px-3 py-2 rounded-lg border border-line text-xs"
+                    style="color: var(--text-secondary); background: var(--bg-secondary);"
+                    x-text="window.t('chat.voicechat.model_list_loading')"></div>
+                <div x-show="modelListState === 'failed' || modelStatusState === 'failed'" x-cloak
+                    class="mb-2 px-3 py-2 rounded-lg border border-line text-xs flex items-center gap-2"
+                    style="color: var(--text-danger); background: var(--bg-secondary);">
+                    <span class="flex-1" x-text="window.t('chat.voicechat.model_list_failed')"></span>
+                    <button @click="loadModels()" class="px-2 py-1 rounded-md border border-line hover:bg-surface-alt"
+                        style="color: var(--text-secondary);" x-text="window.t('chat.voicechat.retry')"></button>
+                </div>
+                <!-- VoiceChat live operator surface. Only capability-backed models render it. -->
+                <div x-show="hasVoiceChatSupport()" x-cloak class="voicechat-panel">
+                    <div class="voicechat-panel-header">
+                        <i data-lucide="audio-lines" class="w-4 h-4" style="color: var(--timeline-accent);"></i>
+                        <span class="voicechat-panel-status" x-text="voiceChatStatusLabel()"></span>
+                        <button x-show="voiceChatSession" @click="endVoiceChat()"
+                            class="px-2 py-1 text-[10px] rounded-md border border-line hover:bg-surface-alt"
+                            style="color: var(--text-secondary);" x-text="window.t('chat.voicechat.stop')"></button>
+                        <button x-show="!voiceChatSession && (voiceChatUiState === 'busy' || voiceChatUiState === 'disconnected' || (voiceChatUiState === 'failed' && voiceChatModelStatus() !== 'failed'))"
+                            @click="retryVoiceChat()"
+                            class="px-2 py-1 text-[10px] rounded-md bg-accent text-accent-fg hover:bg-accent-hover"
+                            x-text="window.t('chat.voicechat.retry')"></button>
+                    </div>
+                    <div class="voicechat-panel-body">
+                        <div x-show="voiceChatUserTranscript" class="voicechat-transcript">
+                            <span class="voicechat-transcript-label" x-text="window.t('chat.voicechat.transcript')"></span>
+                            <span class="voicechat-transcript-text" x-text="voiceChatUserTranscript"></span>
+                        </div>
+                        <div x-show="voiceChatAssistantText" class="voicechat-transcript">
+                            <span class="voicechat-transcript-label" x-text="window.t('chat.voicechat.assistant')"></span>
+                            <span class="voicechat-transcript-text" x-text="voiceChatAssistantText"></span>
+                        </div>
+                        <div x-show="voiceChatTools.length > 0" class="voicechat-transcript">
+                            <span class="voicechat-transcript-label" x-text="window.t('chat.voicechat.tools')"></span>
+                            <template x-for="tool in voiceChatTools" :key="tool.id">
+                                <div class="voicechat-tool-row">
+                                    <i data-lucide="wrench" class="w-3.5 h-3.5 flex-shrink-0"></i>
+                                    <span class="voicechat-tool-name" x-text="tool.name"></span>
+                                    <span class="voicechat-tool-state" x-text="voiceChatToolStatusLabel(tool.status)"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <div x-show="voiceChatError" class="text-xs" style="color: var(--text-danger);"
+                            x-text="voiceChatError"></div>
+                    </div>
+                </div>
+                <div x-show="modelListState === 'stale' || modelStatusState === 'stale'" x-cloak
+                    class="mb-2 px-3 py-2 rounded-lg border border-line text-xs flex items-center gap-2"
+                    style="color: var(--text-secondary); background: var(--bg-secondary);">
+                    <span class="flex-1" x-text="window.t('chat.voicechat.stale_models')"></span>
+                    <button @click="loadModels()" class="px-2 py-1 rounded-md border border-line hover:bg-surface-alt"
+                        x-text="window.t('chat.voicechat.retry')"></button>
+                </div>
                 <div class="input-container" :class="{ 'drag-over': isDragOver }" @dragover.prevent="isDragOver = true"
                     @dragleave.prevent="isDragOver = false" @drop.prevent="isDragOver = false; handleDrop($event)">
                     <!-- Hidden file input for image upload (multiple) -->
@@ -1821,7 +1968,7 @@
                             :title="window.t('chat.upload_image')">
                             <i data-lucide="image" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
                         </button>
-                        <button x-show="hasDocumentSupport() && !hasAsrSupport()" @click="$refs.documentInput.click()"
+                        <button x-show="hasDocumentSupport() && !hasAsrSupport() && !hasVoiceChatSupport()" @click="$refs.documentInput.click()"
                             :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || uploadDocuments.length >= markitdownSettings.max_files_per_request"
                             class="w-10 h-10 m-1 shrink-0 bg-surface-muted hover:bg-surface rounded-full border border-line transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :title="window.t('chat.upload_document')">
@@ -1845,8 +1992,17 @@
                         </button>
                         <span x-show="micActive()" x-cloak class="self-center text-[11px] font-mono px-1"
                             style="color: var(--text-danger);" x-text="formatRecordingTime(micSeconds)"></span>
+                        <!-- Full-duplex VoiceChat microphone -->
+                        <button x-show="hasVoiceChatSupport()" @click="toggleVoiceChat()"
+                            :disabled="voiceChatControlDisabled()"
+                            class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                            :class="voiceChatSession ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
+                            :title="window.t(voiceChatSession ? 'chat.voicechat.stop' : 'chat.voicechat.start')">
+                            <i x-show="!voiceChatSession" data-lucide="mic" class="w-4 h-4" style="color: var(--text-tertiary);"></i>
+                            <div x-show="voiceChatSession" class="w-3 h-3 rounded-[2px]" style="background-color: var(--text-danger);"></div>
+                        </button>
                         <!-- Web search toggle -->
-                        <button x-show="!hasAsrSupport()" @click="chatSettings.webSearchEnabled = !chatSettings.webSearchEnabled; saveChatSettings()"
+                        <button x-show="!hasAsrSupport() && !hasVoiceChatSupport()" @click="chatSettings.webSearchEnabled = !chatSettings.webSearchEnabled; saveChatSettings()"
                             :disabled="!apiKeySet || !currentModel"
                             class="w-10 h-10 m-1 shrink-0 rounded-full border transition-colors flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
                             :class="chatSettings.webSearchEnabled ? 'bg-surface border-accent' : 'bg-surface-muted hover:bg-surface border-line'"
@@ -1859,12 +2015,12 @@
                             autocomplete="off" autocorrect="off"
                             @keydown.enter="onComposerEnter($event)"
                             @input="autoResize($event.target)" @paste="handlePaste($event)"
-                            :placeholder="hasAsrSupport() ? window.t('chat.input_placeholder_asr') : (isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder'))"
-                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || hasAsrSupport()" rows="1"
+                            :placeholder="hasVoiceChatSupport() ? window.t('chat.voicechat.input_placeholder') : (hasAsrSupport() ? window.t('chat.input_placeholder_asr') : (isMobile ? window.t('chat.input_placeholder_mobile') : window.t('chat.input_placeholder')))"
+                            :disabled="!apiKeySet || !currentModel || isCurrentChatStreaming() || hasAsrSupport() || hasVoiceChatSupport()" rows="1"
                             class="flex-1 px-4 py-3 bg-transparent resize-none outline-none text-sm max-h-32"
                             style="color: var(--text-primary);"></textarea>
                         <div class="relative flex-shrink-0">
-                            <button x-show="!isCurrentChatStreaming()" @click="sendMessage()"
+                            <button x-show="!isCurrentChatStreaming() && !hasVoiceChatSupport()" @click="sendMessage()"
                                 :disabled="(hasAsrSupport() ? (!uploadAudio || micActive()) : (!inputMessage.trim() && uploadImages.length === 0 && uploadDocuments.length === 0)) || hasPendingUploads() || !apiKeySet || !currentModel"
                                 class="w-10 h-10 m-1 bg-accent hover:bg-accent-hover disabled:bg-surface-muted rounded-full transition-colors flex items-center justify-center">
                                 <i data-lucide="arrow-up" class="w-4 h-4 text-accent-fg"></i>
@@ -2123,6 +2279,23 @@
                     <div x-show="availableModels.length === 0">
                         {{ t('chat.no_models') }}
                     </div>
+                </div>
+
+                <!-- VoiceChat capability and runtime status -->
+                <div x-show="hasVoiceChatSupport()" x-cloak class="voicechat-model-card">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="audio-lines" class="w-3.5 h-3.5" style="color: var(--timeline-accent);"></i>
+                        <span class="text-[10px] font-bold uppercase tracking-wider flex-1"
+                            style="color: var(--text-secondary);" x-text="window.t('chat.voicechat.label')"></span>
+                        <span class="text-[10px] font-medium" style="color: var(--text-primary);"
+                            x-text="voiceChatModelStatusLabel()"></span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-2 text-[10px]" style="color: var(--text-tertiary);">
+                        <span x-text="window.t('chat.voicechat.input_format').replace('{rate}', voiceChatModelInfo()?.input_sample_rate || 16000)"></span>
+                        <span x-text="window.t('chat.voicechat.output_format').replace('{rate}', voiceChatModelInfo()?.output_sample_rate || 22050)"></span>
+                    </div>
+                    <div x-show="voiceChatModelInfo()?.load_failure_message" class="voicechat-model-card-error"
+                        x-text="voiceChatModelInfo()?.load_failure_message"></div>
                 </div>
 
                 <!-- Temperature & Max Tokens -->
@@ -2597,6 +2770,9 @@
             // Model State
             availableModels: [],
             currentModel: null,
+            modelListState: 'idle',       // idle, loading, ready, stale, failed
+            modelListStale: false,
+            modelStatusState: 'idle',     // idle, loading, ready, stale, failed
 
             // Streaming State
             streamSessions: {},
@@ -2638,6 +2814,14 @@
             micSeconds: 0,
             _micTimerInterval: null,
             realtimeSttMap: {},          // { modelId: bool } from /v1/models/status realtime_stt
+            realtimeVoiceChatMap: {},    // { modelId: bool } from /v1/models/status capability
+            voiceChatModelInfoMap: {},   // safe status and audio metadata by model id
+            voiceChatSession: null,
+            voiceChatUiState: 'idle',    // idle, connecting, active, ending, busy, failed, interrupted, disconnected, ended
+            voiceChatError: '',
+            voiceChatUserTranscript: '',
+            voiceChatAssistantText: '',
+            voiceChatTools: [],          // names and lifecycle only; no arguments or results
             isDragOver: false,           // drag-and-drop state
 
             // Image Modal State
@@ -3912,6 +4096,7 @@
             },
 
             stopAllStreams() {
+                this.stopVoiceChat({ discard: true });
                 Object.values(this.streamSessions).forEach((stream) => {
                     this.cancelStreamTransport(stream);
                     this.resetStreamSession(stream);
@@ -4002,24 +4187,62 @@
             // ===== VLM Detection =====
 
             async fetchModelTypes() {
+        this.modelStatusState = 'loading';
         try {
             const resp = await fetch('/v1/models/status', {
                 headers: { 'Authorization': `Bearer ${this.getApiKey()}` }
             });
-            if (!resp.ok) return;
+            if (!resp.ok) throw new Error('Model status request failed');
             const data = await resp.json();
             const map = {};
             const rtMap = {};
+            const voiceMap = {};
+            const voiceInfo = {};
             for (const m of (data.models || [])) {
                 map[m.id] = m.model_type || 'llm';
                 rtMap[m.id] = Boolean(m.realtime_stt);
+                voiceMap[m.id] = Boolean(m.realtime_voicechat);
+                if (m.realtime_voicechat) {
+                    voiceInfo[m.id] = this.voiceChatInfoFromModel(m);
+                }
             }
             this.modelTypeMap = map;
             this.realtimeSttMap = rtMap;
+            this.realtimeVoiceChatMap = voiceMap;
+            this.voiceChatModelInfoMap = voiceInfo;
+            this.modelStatusState = 'ready';
             this._mirrorAliasModelTypes();
+            return true;
         } catch (e) {
-            // Model status endpoint unavailable
+            this.modelStatusState = Object.keys(this.modelTypeMap).length ? 'stale' : 'failed';
+            // Keep the last known capability map so a transient status failure does not hide controls.
+            return false;
         }
+    },
+
+    voiceChatInfoFromModel(model) {
+        if (!model || !model.realtime_voicechat) return null;
+        return {
+            realtime_voicechat: true,
+            input_sample_rate: model.input_sample_rate || 16000,
+            output_sample_rate: model.output_sample_rate || 22050,
+            frame_duration_ms: model.frame_duration_ms || 80,
+            voicechat_status: model.voicechat_status || (model.loaded ? 'queued' : 'unloaded'),
+            load_failed: Boolean(model.load_failed),
+            load_failure_message: model.load_failure_message || '',
+        };
+    },
+
+    mergeVoiceChatModelMetadata(models) {
+        for (const model of (models || [])) {
+            if (!model?.id) continue;
+            if (model.model_type) this.modelTypeMap[model.id] = model.model_type;
+            if (model.realtime_voicechat) {
+                this.realtimeVoiceChatMap[model.id] = true;
+                this.voiceChatModelInfoMap[model.id] = this.voiceChatInfoFromModel(model);
+            }
+        }
+        this._mirrorAliasModelTypes();
     },
 
     _mirrorAliasModelTypes() {
@@ -4030,6 +4253,10 @@
             }
             if (this.realtimeSttMap[gatewayId] && !(alias in this.realtimeSttMap)) {
                 this.realtimeSttMap[alias] = true;
+            }
+            if (this.realtimeVoiceChatMap[gatewayId] && !(alias in this.realtimeVoiceChatMap)) {
+                this.realtimeVoiceChatMap[alias] = true;
+                this.voiceChatModelInfoMap[alias] = this.cloneData(this.voiceChatModelInfoMap[gatewayId]);
             }
         }
     },
@@ -4049,12 +4276,57 @@
         return Boolean(this.realtimeSttMap[id]);
     },
 
+    hasVoiceChatSupport() {
+        const id = this.resolveGatewayModelId(this.currentModel);
+        return Boolean(this.realtimeVoiceChatMap[id]);
+    },
+
+    voiceChatModelInfo(modelId = this.currentModel) {
+        const id = this.resolveGatewayModelId(modelId);
+        return this.voiceChatModelInfoMap[id] || null;
+    },
+
+    voiceChatModelStatus(modelId = this.currentModel) {
+        const info = this.voiceChatModelInfo(modelId);
+        return info?.voicechat_status || (this.realtimeVoiceChatMap[this.resolveGatewayModelId(modelId)] ? 'unloaded' : null);
+    },
+
+    voiceChatModelStatusLabel(modelId = this.currentModel) {
+        const status = this.voiceChatModelStatus(modelId);
+        const labels = {
+            loading: 'chat.voicechat.loading',
+            failed: 'chat.voicechat.failed',
+            active: 'chat.voicechat.active',
+            unloaded: 'chat.voicechat.unloaded',
+            queued: 'chat.voicechat.ready',
+        };
+        return window.t(labels[status] || 'chat.voicechat.ready');
+    },
+
+    voiceChatStatusLabel() {
+        if (this.voiceChatUiState === 'connecting') return window.t('chat.voicechat.connecting');
+        if (this.voiceChatUiState === 'active') return window.t('chat.voicechat.listening');
+        if (this.voiceChatUiState === 'ending') return window.t('chat.voicechat.ending');
+        if (this.voiceChatUiState === 'busy') return window.t('chat.voicechat.busy');
+        if (this.voiceChatUiState === 'interrupted') return window.t('chat.voicechat.interrupted');
+        if (this.voiceChatUiState === 'disconnected') return window.t('chat.voicechat.disconnected');
+        if (this.voiceChatUiState === 'ended') return window.t('chat.voicechat.ended');
+        if (this.voiceChatUiState === 'failed') return window.t('chat.voicechat.failed');
+        return this.voiceChatModelStatusLabel();
+    },
+
+    voiceChatControlDisabled() {
+        if (!this.apiKeySet || !this.currentModel || !this.hasVoiceChatSupport()) return true;
+        if (this.voiceChatUiState === 'connecting' || this.voiceChatUiState === 'ending') return true;
+        return this.voiceChatModelStatus() === 'loading' || this.voiceChatModelStatus() === 'failed';
+    },
+
     micActive() {
         return this.micSession !== null;
     },
 
     hasDocumentSupport() {
-        return Boolean(this.currentModel && this.markitdownSettings.enabled);
+        return Boolean(this.currentModel && this.markitdownSettings.enabled && !this.hasVoiceChatSupport());
     },
 
     hasPendingUploads() {
@@ -4718,9 +4990,12 @@
             listeners.push({ signal, listener: abort });
         }
         return { signal: controller.signal, dispose };
-    },
+            },
 
             async loadModels() {
+        const previousModels = this.availableModels;
+        const previousAdminModels = this._adminModelsList;
+        this.modelListState = 'loading';
         try {
             this._adminModelsList = null;
             const apiHeaders = this.getApiKey()
@@ -4752,6 +5027,7 @@
                     this.apiKeySet = false;
                     this.messages = [];
                     this.currentChatId = null;
+                    this.modelListState = 'failed';
                     return;
                 }
                 throw new Error('Failed to load models');
@@ -4772,6 +5048,7 @@
                         this.aliasToGateway[alias] = m.id;
                     }
                 }
+                this.mergeVoiceChatModelMetadata(this._adminModelsList);
             }
             if (clusterDeploymentsResponse.ok) {
                 const clusterData = await clusterDeploymentsResponse.json();
@@ -4819,12 +5096,16 @@
                 allModels.filter(m => {
                     const gatewayId = this.aliasToGateway[m.id] || m.id;
                     const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker';
+                    const isVoiceChat = Boolean(this.realtimeVoiceChatMap[gatewayId]);
+                    return (t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker') || isVoiceChat;
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
                     owned_by: m.owned_by,
-                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id)
+                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id),
+                    realtime_voicechat: Boolean(
+                        this.realtimeVoiceChatMap[this.aliasToGateway[m.id] || m.id]
+                    ),
                 }))
             );
 
@@ -4836,7 +5117,12 @@
             }
 
             this.reconcileCurrentModelAfterLoad(defaultModel);
+            this.modelListState = 'ready';
+            this.modelListStale = false;
         } catch (error) {
+            this._adminModelsList = previousAdminModels;
+            this.modelListStale = previousModels.length > 0;
+            this.modelListState = this.modelListStale ? 'stale' : 'failed';
             console.error('Error loading models:', error);
         }
     },
@@ -4849,6 +5135,7 @@
                 if (!response.ok) throw new Error('Failed to load admin models');
                 const data = await response.json();
                 this._adminModelsList = data.models || [];
+                this.mergeVoiceChatModelMetadata(this._adminModelsList);
                 return this._adminModelsList;
             })
             .finally(() => {
@@ -4868,6 +5155,7 @@
             const models = await this.fetchAdminModelsList();
             const model = models.find(m => m.id === modelId);
             if (!model) return;
+            this.mergeVoiceChatModelMetadata([model]);
             this.isMtpCompatible = !!model.mtp_compatible;
             this.isVlm = model.model_type === 'vlm';
         } catch (e) {
@@ -4882,6 +5170,8 @@
             const models = await this.fetchAdminModelsList();
             const model = models.find(m => m.id === modelId);
             if (!model) return;
+
+            this.mergeVoiceChatModelMetadata([model]);
 
             this.isMtpCompatible = !!model.mtp_compatible;
             this.isVlm = model.model_type === 'vlm';
@@ -5161,6 +5451,9 @@
         const session = this.getChatSession(this.currentChatId, true);
         const gatewayId = this.resolveGatewayModelId(modelId);
         try {
+            if (this.voiceChatSession && this.voiceChatSession.requestModel !== gatewayId) {
+                this.stopVoiceChat({ discard: true });
+            }
             if (session?.model && session.model !== gatewayId) {
                 this.syncSessionModelSettingsFromUi(session);
                 this.saveModelSettingsForModel(session, session.model);
@@ -5256,6 +5549,7 @@
     },
 
     async startNewChat() {
+        if (this.voiceChatSession) this.stopVoiceChat({ discard: true });
         this.cancelPersistModelSettingsTimer();
         const prevChatId = this.currentChatId;
         if (prevChatId) {
@@ -5328,6 +5622,9 @@
     },
 
     async loadChat(chatId) {
+        if (this.voiceChatSession && this.currentChatId !== chatId) {
+            this.stopVoiceChat({ discard: true });
+        }
         this.cancelPersistModelSettingsTimer();
         if (this.currentChatId && this.currentChatId !== chatId) {
             const prevSession = this.getChatSession(this.currentChatId, false);
@@ -5513,6 +5810,7 @@
     },
 
     async sendMessage() {
+        if (this.hasVoiceChatSupport()) return;
         if (this.hasAsrSupport()) {
             await this.sendTranscriptionMessage();
             return;
@@ -5727,6 +6025,805 @@
             if (this.currentChatId === chatId) this.scheduleEnhanceMessages();
         } finally {
             this.resetStreamSession(stream, { preserveFinalContent: true });
+        }
+    },
+
+    // ===== Realtime VoiceChat operator session =====
+
+    resetVoiceChatTurnState() {
+        this.voiceChatError = '';
+        this.voiceChatUserTranscript = '';
+        this.voiceChatAssistantText = '';
+        this.voiceChatTools = [];
+    },
+
+    newVoiceChatEventId(prefix = 'voice') {
+        return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+    },
+
+    voiceChatSend(session, payload) {
+        if (!session?.ws || session.ws.readyState !== WebSocket.OPEN) return false;
+        try {
+            session.ws.send(JSON.stringify(payload));
+            return true;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    toggleVoiceChat() {
+        if (this.voiceChatSession) {
+            this.endVoiceChat();
+        } else {
+            this.startVoiceChat();
+        }
+    },
+
+    async startVoiceChat() {
+        if (!this.hasVoiceChatSupport() || this.voiceChatSession) return;
+        if (this.voiceChatUiState === 'connecting' || this.voiceChatUiState === 'ending') return;
+        if (this.voiceChatModelStatus() === 'failed') {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.model_failed');
+            return;
+        }
+        if (!navigator.mediaDevices?.getUserMedia) {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.mic_denied');
+            return;
+        }
+
+        const sourceModel = this.resolveGatewayModelId(this.currentModel);
+        this.resetVoiceChatTurnState();
+        this.voiceChatUiState = 'connecting';
+
+        let mediaStream;
+        try {
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+            });
+        } catch (e) {
+            const denied = e?.name === 'NotAllowedError' || e?.name === 'PermissionDeniedError';
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t(denied ? 'chat.voicechat.mic_denied' : 'chat.error.mic_unavailable');
+            return;
+        }
+
+        if (!this.hasVoiceChatSupport() || this.resolveGatewayModelId(this.currentModel) !== sourceModel) {
+            mediaStream.getTracks().forEach(t => t.stop());
+            this.voiceChatUiState = 'idle';
+            return;
+        }
+        if (!this.currentChatId) {
+            try {
+                await this.startNewChat();
+            } catch (e) {
+                mediaStream.getTracks().forEach(t => t.stop());
+                this.voiceChatUiState = 'failed';
+                this.voiceChatError = window.t('chat.voicechat.failed');
+                return;
+            }
+        }
+
+        const chatId = this.currentChatId;
+        const session = {
+            chatId,
+            requestModel: sourceModel,
+            ws: null,
+            mediaStream,
+            audioContext: null,
+            captureSource: null,
+            captureSink: null,
+            workletNode: null,
+            captureChunk: null,
+            browserSampleRate: 0,
+            inputSampleRate: 16000,
+            outputSampleRate: 22050,
+            frameSamples: 1280,
+            ready: false,
+            startSent: false,
+            updateSent: false,
+            receivedAudio: false,
+            sentAudio: false,
+            pendingInput: new Float32Array(0),
+            resampleBuffer: new Float32Array(0),
+            resamplePosition: 0,
+            userTranscript: '',
+            assistantText: '',
+            responseDone: false,
+            stopping: false,
+            interrupted: false,
+            finalized: false,
+            discard: false,
+            errorCode: null,
+            interruptionSent: false,
+            playbackSources: new Set(),
+            playbackActive: false,
+            nextPlaybackTime: 0,
+            turnCommitted: false,
+            _beforeUnload: () => this.stopVoiceChat({ discard: true }),
+        };
+        this.voiceChatSession = session;
+
+        try {
+            const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+            if (!AudioContextCtor) throw new Error('AudioContext unavailable');
+            session.audioContext = new AudioContextCtor();
+            session.browserSampleRate = session.audioContext.sampleRate || 48000;
+            if (session.audioContext.state === 'suspended') {
+                await session.audioContext.resume();
+            }
+            const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const ws = new WebSocket(
+                `${wsProto}://${location.host}/v1/realtime?model=${encodeURIComponent(sourceModel)}`
+            );
+            ws.binaryType = 'arraybuffer';
+            session.ws = ws;
+            window.addEventListener('beforeunload', session._beforeUnload);
+
+            ws.onopen = () => {
+                if (this.voiceChatSession !== session || session.finalized) return;
+                session.startSent = this.voiceChatSend(session, {
+                    type: 'start',
+                    model: sourceModel,
+                    api_key: this.getApiKey(),
+                });
+            };
+            ws.onmessage = (event) => {
+                this.handleVoiceChatMessage(session, event).catch(() => {
+                    this.failVoiceChatSession(session, 'connection_error');
+                });
+            };
+            ws.onerror = () => {
+                if (this.voiceChatSession !== session || session.finalized) return;
+                if (!session.errorCode) session.errorCode = 'connection_error';
+            };
+            ws.onclose = (event) => {
+                this.finishVoiceChatSession(session, event.code);
+            };
+        } catch (e) {
+            this.failVoiceChatSession(session, 'connection_error');
+        }
+    },
+
+    voiceChatSessionUpdate(session) {
+        const info = this.voiceChatModelInfo(session.requestModel) || {};
+        const inputRate = Number(info.input_sample_rate) || 16000;
+        const outputRate = Number(info.output_sample_rate) || 22050;
+        const frameDuration = Number(info.frame_duration_ms) || 80;
+        const sessionConfig = {
+            type: 'realtime',
+            model: session.requestModel,
+            input_sample_rate: inputRate,
+            output_sample_rate: outputRate,
+            frame_duration_ms: frameDuration,
+            input_audio_format: { type: 'pcm16', sample_rate: inputRate, channels: 1 },
+            output_audio_format: { type: 'pcm16', sample_rate: outputRate, channels: 1 },
+        };
+        const prompt = String(this.systemPrompt || '').trim();
+        if (prompt) sessionConfig.instructions = prompt;
+        const tools = this.activeTools();
+        if (tools.length) sessionConfig.tools = tools;
+        return this.voiceChatSend(session, {
+            type: 'session.update',
+            event_id: this.newVoiceChatEventId('session'),
+            session: sessionConfig,
+        });
+    },
+
+    async handleVoiceChatMessage(session, event) {
+        if (this.voiceChatSession !== session || session.finalized) return;
+        let data;
+        try {
+            data = typeof event.data === 'string' ? JSON.parse(event.data) : null;
+        } catch (e) {
+            return;
+        }
+        if (!data?.type) return;
+
+        if (data.type === 'session.created') {
+            if (!session.updateSent) {
+                session.updateSent = this.voiceChatSessionUpdate(session);
+            }
+            return;
+        }
+        if (data.type === 'session.updated') {
+            const modelSession = data.session || {};
+            const inputFormat = modelSession.input_audio_format || {};
+            const outputFormat = modelSession.output_audio_format || {};
+            session.inputSampleRate = Number(inputFormat.sample_rate) || session.inputSampleRate;
+            session.outputSampleRate = Number(outputFormat.sample_rate) || session.outputSampleRate;
+            session.frameSamples = Number(modelSession.frame_samples)
+                || Math.round(session.inputSampleRate * 0.08);
+            if (modelSession.state !== 'ready') return;
+            session.ready = true;
+            this.setVoiceChatModelStatus(session.requestModel, 'active');
+            this.voiceChatUiState = 'active';
+            try {
+                await this.startVoiceChatCapture(session);
+            } catch (e) {
+                this.failVoiceChatSession(session, 'connection_error');
+            }
+            return;
+        }
+        if (data.type === 'conversation.item.input_audio_transcription.delta') {
+            const delta = typeof data.delta === 'string' ? data.delta : '';
+            if (delta) {
+                session.userTranscript += delta;
+                this.voiceChatUserTranscript = session.userTranscript;
+                this.scrollToBottom();
+            }
+            return;
+        }
+        if (data.type === 'conversation.item.input_audio_transcription.completed') {
+            if (typeof data.transcript === 'string') {
+                session.userTranscript = data.transcript;
+                this.voiceChatUserTranscript = data.transcript;
+            }
+            return;
+        }
+        if (data.type === 'response.text.delta') {
+            const delta = typeof data.delta === 'string' ? data.delta : '';
+            if (delta) {
+                session.assistantText += delta;
+                this.voiceChatAssistantText = session.assistantText;
+                this.scrollToBottom();
+            }
+            return;
+        }
+        if (data.type === 'response.audio.delta') {
+            this.queueVoiceChatAudio(session, data.delta, data.sample_rate);
+            return;
+        }
+        if (data.type === 'response.function_call_arguments.delta') {
+            this.handleVoiceChatToolDelta(data);
+            return;
+        }
+        if (data.type === 'response.function_call_arguments.done') {
+            this.handleVoiceChatToolDone(data);
+            return;
+        }
+        if (data.type === 'response.done') {
+            session.responseDone = true;
+            this.voiceChatTools.forEach(tool => {
+                if (tool.status === 'pending') this.setVoiceChatToolStatus(tool, 'completed');
+            });
+            return;
+        }
+        if (data.type === 'response.cancelled') {
+            if (session.interrupted) this.voiceChatUiState = 'interrupted';
+            return;
+        }
+        if (data.type === 'error') {
+            this.handleVoiceChatError(data);
+        }
+    },
+
+    voiceChatToolKey(data) {
+        return data?.call_id || data?.item_id || data?.name || `tool_${Date.now().toString(36)}`;
+    },
+
+    setVoiceChatToolStatus(tool, status) {
+        if (!tool || tool.status === 'timed_out') return;
+        if (tool.timer) {
+            clearTimeout(tool.timer);
+            tool.timer = null;
+        }
+        tool.status = status;
+    },
+
+    handleVoiceChatToolDelta(data) {
+        const key = this.voiceChatToolKey(data);
+        let tool = this.voiceChatTools.find(item => item.id === key);
+        if (!tool) {
+            tool = {
+                id: key,
+                name: typeof data?.name === 'string' ? data.name : window.t('chat.voicechat.label'),
+                status: 'pending',
+                timer: null,
+            };
+            this.voiceChatTools.push(tool);
+        } else if (tool.status !== 'timed_out') {
+            tool.status = 'pending';
+        }
+        if (!tool.timer && tool.status === 'pending') {
+            tool.timer = setTimeout(() => this.markVoiceChatToolTimedOut(key), this.TOOL_TIMEOUT_MS);
+        }
+    },
+
+    handleVoiceChatToolDone(data) {
+        const key = this.voiceChatToolKey(data);
+        const tool = this.voiceChatTools.find(item => item.id === key);
+        if (tool) {
+            this.setVoiceChatToolStatus(tool, 'completed');
+        } else {
+            this.voiceChatTools.push({
+                id: key,
+                name: typeof data?.name === 'string' ? data.name : window.t('chat.voicechat.label'),
+                status: 'completed',
+                timer: null,
+            });
+        }
+        // The merged backend emits the function call but cannot accept a result yet.
+        this.voiceChatError = window.t('chat.voicechat.tool_unsupported');
+    },
+
+    markVoiceChatToolTimedOut(toolId) {
+        const tool = this.voiceChatTools.find(item => item.id === toolId);
+        if (!tool || tool.status !== 'pending') return;
+        tool.timer = null;
+        tool.status = 'timed_out';
+        this.voiceChatError = window.t('chat.voicechat.tool_timed_out');
+    },
+
+    voiceChatToolStatusLabel(status) {
+        const keys = {
+            pending: 'chat.voicechat.tool_pending',
+            completed: 'chat.voicechat.tool_completed',
+            failed: 'chat.voicechat.tool_failed',
+            timed_out: 'chat.voicechat.tool_timed_out',
+        };
+        return window.t(keys[status] || keys.failed);
+    },
+
+    handleVoiceChatError(data) {
+        const error = data?.error || {};
+        const code = error.code || data?.code || 'connection_error';
+        const timedOut = code === 'timeout' || code === 'tool_timeout'
+            || String(code).includes('timeout');
+        const pendingStatus = timedOut ? 'timed_out' : 'failed';
+        this.voiceChatTools.forEach(tool => {
+            if (tool.status === 'pending') this.setVoiceChatToolStatus(tool, pendingStatus);
+        });
+        if (this.voiceChatSession) this.voiceChatSession.errorCode = code;
+        if (code === 'server_busy') {
+            this.voiceChatUiState = 'busy';
+            this.voiceChatError = window.t('chat.voicechat.busy');
+        } else if (code === 'session_initialization_failed' || code === 'unsupported_model') {
+            this.setVoiceChatModelStatus(this.voiceChatSession?.requestModel || this.currentModel, 'failed');
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.model_failed');
+        } else if (code === 'no_audio') {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.no_audio');
+        } else if (code === 'unsupported_operation' && this.voiceChatTools.length) {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.tool_unsupported');
+        } else if (timedOut) {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.tool_timed_out');
+        } else if (code === 'invalid_api_key') {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.error.incorrect_api_key');
+        } else {
+            this.voiceChatUiState = 'failed';
+            this.voiceChatError = window.t('chat.voicechat.failed');
+        }
+    },
+
+    setVoiceChatModelStatus(modelId, status) {
+        const id = this.resolveGatewayModelId(modelId);
+        const info = this.voiceChatModelInfoMap[id];
+        if (info) this.voiceChatModelInfoMap[id] = { ...info, voicechat_status: status };
+    },
+
+    _voiceChatWorkletSource() {
+        return `
+            class OmlxVoiceChatCapture extends AudioWorkletProcessor {
+                constructor() { super(); this._buf = []; this._len = 0; }
+                process(inputs) {
+                    const ch = inputs[0] && inputs[0][0];
+                    if (ch) {
+                        this._buf.push(new Float32Array(ch));
+                        this._len += ch.length;
+                        if (this._len >= 2048) {
+                            const out = new Float32Array(this._len);
+                            let offset = 0;
+                            for (const block of this._buf) { out.set(block, offset); offset += block.length; }
+                            this.port.postMessage(out, [out.buffer]);
+                            this._buf = []; this._len = 0;
+                        }
+                    }
+                    return true;
+                }
+            }
+            registerProcessor('omlx-voicechat-capture', OmlxVoiceChatCapture);
+        `;
+    },
+
+    _resampleVoiceChatSamples(session, samples, final = false) {
+        const input = samples instanceof Float32Array
+            ? samples
+            : new Float32Array(samples || []);
+        const sourceRate = Number(session.browserSampleRate) || 48000;
+        const targetRate = Number(session.inputSampleRate) || 16000;
+        if (sourceRate === targetRate) return input;
+
+        const prior = session.resampleBuffer || new Float32Array(0);
+        const source = prior.length
+            ? new Float32Array([...prior, ...input])
+            : input;
+        if (!source.length) {
+            return new Float32Array(0);
+        }
+        const step = sourceRate / targetRate;
+        const output = [];
+        let position = Number(session.resamplePosition) || 0;
+        while (position <= source.length - 1) {
+            const index = Math.floor(position);
+            const next = Math.min(index + 1, source.length - 1);
+            const fraction = position - index;
+            output.push(source[index] * (1 - fraction) + source[next] * fraction);
+            position += step;
+        }
+        // Keep the final source sample so the next browser chunk can provide
+        // the interpolation pair instead of skipping the rate-conversion edge.
+        const keep = Math.min(Math.floor(position), source.length - 1);
+        session.resampleBuffer = source.slice(keep);
+        session.resamplePosition = position - keep;
+        if (final && session.resampleBuffer.length) {
+            const tail = session.resampleBuffer;
+            let tailPosition = session.resamplePosition;
+            const beforeTail = output.length;
+            while (tailPosition < tail.length) {
+                const index = Math.floor(tailPosition);
+                const next = Math.min(index + 1, tail.length - 1);
+                const fraction = tailPosition - index;
+                output.push(tail[index] * (1 - fraction) + tail[next] * fraction);
+                tailPosition += step;
+            }
+            if (output.length === beforeTail) output.push(tail[tail.length - 1]);
+            session.resampleBuffer = new Float32Array(0);
+            session.resamplePosition = 0;
+        }
+        return Float32Array.from(output);
+    },
+
+    _voiceChatChunkHasSpeech(samples) {
+        if (!samples?.length) return false;
+        let energy = 0;
+        for (const sample of samples) energy += sample * sample;
+        return Math.sqrt(energy / samples.length) > 0.025;
+    },
+
+    _floatSamplesToPcm16(samples) {
+        const pcm = new Int16Array(samples.length);
+        for (let i = 0; i < samples.length; i++) {
+            const sample = Math.max(-1, Math.min(1, Number(samples[i]) || 0));
+            pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        }
+        return pcm;
+    },
+
+    _pcm16ToBase64(pcm) {
+        const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+        let binary = '';
+        const blockSize = 0x8000;
+        for (let start = 0; start < bytes.length; start += blockSize) {
+            binary += String.fromCharCode(...bytes.subarray(start, start + blockSize));
+        }
+        return btoa(binary);
+    },
+
+    _sendVoiceChatSamples(session, samples) {
+        if (!samples?.length) return false;
+        const sent = this.voiceChatSend(session, {
+            type: 'input_audio_buffer.append',
+            event_id: this.newVoiceChatEventId('audio'),
+            audio: this._pcm16ToBase64(this._floatSamplesToPcm16(samples)),
+            sample_rate: session.inputSampleRate,
+        });
+        if (sent) {
+            session.receivedAudio = true;
+            session.sentAudio = true;
+        }
+        return sent;
+    },
+
+    _appendVoiceChatInput(session, samples) {
+        if (!samples?.length || session.finalized) return;
+        session.pendingInput = session.pendingInput.length
+            ? new Float32Array([...session.pendingInput, ...samples])
+            : samples;
+        const frameSamples = session.frameSamples || 1280;
+        while (session.pendingInput.length >= frameSamples) {
+            const frame = session.pendingInput.slice(0, frameSamples);
+            session.pendingInput = session.pendingInput.slice(frameSamples);
+            if (!this._sendVoiceChatSamples(session, frame)) return;
+        }
+    },
+
+    _flushVoiceChatInput(session) {
+        if (!session || session.finalized) return;
+        const tail = this._resampleVoiceChatSamples(session, new Float32Array(0), true);
+        this._appendVoiceChatInput(session, tail);
+        if (session.pendingInput.length) {
+            const pending = session.pendingInput;
+            session.pendingInput = new Float32Array(0);
+            this._sendVoiceChatSamples(session, pending);
+        }
+    },
+
+    async startVoiceChatCapture(session) {
+        const context = session.audioContext;
+        if (!context || !session.mediaStream) throw new Error('Audio capture unavailable');
+        const source = context.createMediaStreamSource(session.mediaStream);
+        session.captureSource = source;
+
+        const handleChunk = (chunk) => {
+            if (session.finalized || session.stopping) return;
+            if (session.playbackActive && this._voiceChatChunkHasSpeech(chunk)) {
+                this.interruptVoiceChat(session);
+                return;
+            }
+            const resampled = this._resampleVoiceChatSamples(session, chunk);
+            this._appendVoiceChatInput(session, resampled);
+        };
+        session.captureChunk = handleChunk;
+
+        const sink = context.createGain ? context.createGain() : null;
+        if (sink) {
+            sink.gain.value = 0;
+            sink.connect(context.destination);
+            session.captureSink = sink;
+        }
+        if (context.audioWorklet && window.AudioWorkletNode) {
+            const blobUrl = URL.createObjectURL(
+                new Blob([this._voiceChatWorkletSource()], { type: 'application/javascript' })
+            );
+            try {
+                await context.audioWorklet.addModule(blobUrl);
+            } finally {
+                URL.revokeObjectURL(blobUrl);
+            }
+            const worklet = new AudioWorkletNode(context, 'omlx-voicechat-capture');
+            worklet.port.onmessage = (event) => handleChunk(event.data);
+            source.connect(worklet);
+            if (sink) worklet.connect(sink);
+            session.workletNode = worklet;
+            return;
+        }
+        if (!context.createScriptProcessor) throw new Error('Audio capture unavailable');
+        const processor = context.createScriptProcessor(2048, 1, 1);
+        processor.onaudioprocess = (event) => handleChunk(event.inputBuffer.getChannelData(0));
+        source.connect(processor);
+        if (sink) processor.connect(sink);
+        session.workletNode = processor;
+    },
+
+    _stopVoiceChatCapture(session) {
+        if (!session) return;
+        if (session.workletNode) {
+            try { session.workletNode.disconnect(); } catch (e) { }
+            session.workletNode = null;
+        }
+        if (session.captureSource) {
+            try { session.captureSource.disconnect(); } catch (e) { }
+            session.captureSource = null;
+        }
+        if (session.captureSink) {
+            try { session.captureSink.disconnect(); } catch (e) { }
+            session.captureSink = null;
+        }
+        if (session.mediaStream) {
+            session.mediaStream.getTracks().forEach(t => t.stop());
+            session.mediaStream = null;
+        }
+        session.captureChunk = null;
+    },
+
+    stopVoiceChatPlayback(session) {
+        if (!session) return;
+        for (const source of session.playbackSources || []) {
+            try { source.stop(0); } catch (e) { }
+            try { source.disconnect(); } catch (e) { }
+        }
+        session.playbackSources?.clear();
+        session.playbackActive = false;
+        session.nextPlaybackTime = 0;
+    },
+
+    queueVoiceChatAudio(session, encoded, sampleRate) {
+        if (!session || session.finalized || typeof encoded !== 'string' || !encoded) return;
+        const context = session.audioContext;
+        if (!context) return;
+        try {
+            if (context.state === 'suspended') Promise.resolve(context.resume()).catch(() => {});
+            const binary = atob(encoded);
+            const byteLength = binary.length - (binary.length % 2);
+            const bytes = new Uint8Array(byteLength);
+            for (let i = 0; i < byteLength; i++) bytes[i] = binary.charCodeAt(i);
+            const view = new DataView(bytes.buffer);
+            const samples = new Float32Array(byteLength / 2);
+            for (let i = 0; i < samples.length; i++) samples[i] = view.getInt16(i * 2, true) / 32768;
+            if (!samples.length) return;
+            const rate = Number(sampleRate) || session.outputSampleRate || 22050;
+            const buffer = context.createBuffer(1, samples.length, rate);
+            buffer.getChannelData(0).set(samples);
+            const source = context.createBufferSource();
+            source.buffer = buffer;
+            source.connect(context.destination);
+            const now = context.currentTime || 0;
+            const startAt = Math.max(now + 0.01, session.nextPlaybackTime || 0);
+            session.playbackSources.add(source);
+            session.playbackActive = true;
+            session.nextPlaybackTime = startAt + buffer.duration;
+            source.onended = () => {
+                session.playbackSources.delete(source);
+                if (!session.playbackSources.size) session.playbackActive = false;
+            };
+            source.start(startAt);
+        } catch (e) {
+            this.failVoiceChatSession(session, 'audio_playback');
+        }
+    },
+
+    interruptVoiceChat(session = this.voiceChatSession) {
+        if (!session || session.finalized || session.interruptionSent) return;
+        session.interruptionSent = true;
+        session.interrupted = true;
+        session.stopping = true;
+        this.voiceChatUiState = 'interrupted';
+        this.voiceChatError = '';
+        this.stopVoiceChatPlayback(session);
+        this._stopVoiceChatCapture(session);
+        if (!this.voiceChatSend(session, {
+            type: 'response.cancel',
+            event_id: this.newVoiceChatEventId('interrupt'),
+        })) {
+            this.finishVoiceChatSession(session, 1000);
+        }
+    },
+
+    async endVoiceChat() {
+        const session = this.voiceChatSession;
+        if (!session || session.stopping) return;
+        session.stopping = true;
+        this.voiceChatUiState = 'ending';
+        this._flushVoiceChatInput(session);
+        this._stopVoiceChatCapture(session);
+        if (session.ws?.readyState === WebSocket.OPEN && session.sentAudio) {
+            this.voiceChatSend(session, {
+                type: 'input_audio_buffer.commit',
+                event_id: this.newVoiceChatEventId('commit'),
+                pad_partial: true,
+            });
+            return;
+        }
+        if (session.ws?.readyState === WebSocket.OPEN) {
+            this.voiceChatSend(session, {
+                type: 'response.cancel',
+                event_id: this.newVoiceChatEventId('cancel'),
+            });
+        } else {
+            this.finishVoiceChatSession(session, 1000);
+        }
+    },
+
+    stopVoiceChat({ discard = false } = {}) {
+        const session = this.voiceChatSession;
+        if (!session) {
+            if (discard) {
+                this.voiceChatUiState = 'idle';
+                this.resetVoiceChatTurnState();
+            }
+            return;
+        }
+        if (!discard) {
+            this.endVoiceChat();
+            return;
+        }
+        session.discard = true;
+        session.stopping = true;
+        this.stopVoiceChatPlayback(session);
+        this._stopVoiceChatCapture(session);
+        this.finishVoiceChatSession(session, 1000);
+        try {
+            if (session.ws?.readyState === WebSocket.OPEN
+                || session.ws?.readyState === WebSocket.CONNECTING) session.ws.close();
+        } catch (e) { }
+    },
+
+    retryVoiceChat() {
+        if (this.voiceChatSession) this.stopVoiceChat({ discard: true });
+        this.resetVoiceChatTurnState();
+        this.voiceChatUiState = 'idle';
+        this.startVoiceChat();
+    },
+
+    _commitVoiceChatTurn(session) {
+        if (!session || session.turnCommitted || session.discard) return;
+        session.turnCommitted = true;
+        if (this.voiceChatUiState === 'busy') return;
+        const chatSession = this.getChatSession(session.chatId, true);
+        if (!chatSession) return;
+        chatSession.model = session.requestModel;
+        if (session.userTranscript.trim()) {
+            chatSession.messages.push({
+                id: this.newMessageId(),
+                role: 'user',
+                content: session.userTranscript.trim(),
+                _voicechat: true,
+            });
+        }
+        if (session.assistantText.trim()) {
+            chatSession.messages.push({
+                id: this.newMessageId(),
+                role: 'assistant',
+                content: session.assistantText.trim(),
+                model: session.requestModel,
+                _voicechat: true,
+                _perfVisible: false,
+            });
+        }
+        this.messages = chatSession.messages;
+        this.saveCurrentChat(session.chatId, chatSession.messages, chatSession.model, chatSession.systemPrompt);
+        if (this.currentChatId === session.chatId) this.scheduleEnhanceMessages();
+    },
+
+    _cleanupVoiceChatSession(session) {
+        this.stopVoiceChatPlayback(session);
+        if (session.audioContext) {
+            try { session.audioContext.close(); } catch (e) { }
+            session.audioContext = null;
+        }
+        window.removeEventListener('beforeunload', session._beforeUnload);
+    },
+
+    finishVoiceChatSession(session, closeCode = 1000) {
+        if (!session || session.finalized) return;
+        session.finalized = true;
+        this._stopVoiceChatCapture(session);
+        this.clearVoiceChatToolTimers();
+        if (!session.discard) this._commitVoiceChatTurn(session);
+
+        if (session.discard) {
+            this.voiceChatUiState = 'idle';
+            this.resetVoiceChatTurnState();
+        } else if (this.voiceChatUiState === 'connecting' || this.voiceChatUiState === 'active'
+            || this.voiceChatUiState === 'ending') {
+            this.voiceChatUiState = session.responseDone || session.stopping
+                ? 'ended' : (closeCode === 1013 ? 'busy' : 'disconnected');
+            if (this.voiceChatUiState === 'busy') this.voiceChatError = window.t('chat.voicechat.busy');
+            if (this.voiceChatUiState === 'disconnected') this.voiceChatError = window.t('chat.voicechat.disconnected');
+        }
+        if (!session.discard && this.voiceChatUiState !== 'failed' && this.voiceChatUiState !== 'busy') {
+            this.setVoiceChatModelStatus(session.requestModel, 'queued');
+        }
+        if (this.voiceChatSession === session) this.voiceChatSession = null;
+
+        const context = session.audioContext;
+        const remainingMs = context && session.playbackActive
+            ? Math.max(0, (session.nextPlaybackTime - context.currentTime) * 1000) + 50
+            : 0;
+        if (remainingMs > 0) {
+            setTimeout(() => this._cleanupVoiceChatSession(session), remainingMs);
+        } else {
+            this._cleanupVoiceChatSession(session);
+        }
+    },
+
+    failVoiceChatSession(session, code = 'connection_error') {
+        if (!session || session.finalized) return;
+        session.errorCode = code;
+        this.handleVoiceChatError({ type: 'error', error: { code } });
+        this.stopVoiceChatPlayback(session);
+        this.finishVoiceChatSession(session, 1011);
+        try {
+            if (session.ws?.readyState === WebSocket.OPEN
+                || session.ws?.readyState === WebSocket.CONNECTING) session.ws.close();
+        } catch (e) { }
+    },
+
+    clearVoiceChatToolTimers() {
+        for (const tool of this.voiceChatTools) {
+            if (tool.timer) clearTimeout(tool.timer);
+            tool.timer = null;
         }
     },
 
@@ -6644,6 +7741,10 @@
     },
 
     stopStreaming() {
+        if (this.voiceChatSession) {
+            this.stopVoiceChat();
+            return;
+        }
         if (this.currentChatId) {
             this.stopChatStreaming(this.currentChatId);
         }
@@ -7030,6 +8131,9 @@
     async deleteChat(chatId, { skipConfirm = false } = {}) {
         if (!skipConfirm && !confirm(window.t('chat.confirm_delete_chat'))) return;
 
+        if (this.voiceChatSession && this.voiceChatSession.chatId === chatId) {
+            this.stopVoiceChat({ discard: true });
+        }
         this.cancelStreamTransport(this.getStreamSession(chatId, false));
         delete this.streamSessions[chatId];
         delete this.chatSessions[chatId];
@@ -7363,7 +8467,7 @@
         const mod = e.metaKey || e.ctrlKey;
         if (e.key === 'Escape') {
             if (this.showShortcutsHelp) { this.showShortcutsHelp = false; return; }
-            if (!this._isTypingTarget(e) && this.isCurrentChatStreaming()) {
+            if (!this._isTypingTarget(e) && (this.isCurrentChatStreaming() || this.voiceChatSession)) {
                 this.stopStreaming();
             }
             return;

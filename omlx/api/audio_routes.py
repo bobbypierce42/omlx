@@ -30,7 +30,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from ..server_metrics import get_server_metrics
@@ -202,6 +202,54 @@ def _cleanup_tempfile(path: Optional[str]) -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def _metadata_value(metadata: object | None, name: str):
+    if isinstance(metadata, dict):
+        return metadata.get(name)
+    return getattr(metadata, name, None)
+
+
+def _is_voicechat_metadata(metadata: object | None) -> bool:
+    return (
+        _metadata_value(metadata, "engine_type") in {"voicechat", "realtime_voicechat"}
+        or _metadata_value(metadata, "realtime_voicechat") is True
+        or _metadata_value(metadata, "is_voicechat") is True
+    )
+
+
+def _validate_wav_output(output: object) -> bytes:
+    if not isinstance(output, (bytes, bytearray)) or not output:
+        raise HTTPException(
+            status_code=500,
+            detail="Audio processing produced no WAV output",
+        )
+
+    wav_bytes = bytes(output)
+    try:
+        wav_bytes_to_pcm_frames(wav_bytes)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Audio processing produced invalid WAV output",
+        ) from exc
+    return wav_bytes
+
+
+def _voicechat_busy_response(exc: BaseException) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": str(exc),
+                "type": "server_error",
+                "param": None,
+                "code": "busy",
+                "retryable": True,
+            }
+        },
+        headers={"Retry-After": "1"},
+    )
 
 
 def _resolve_tts_streaming_interval(request: AudioSpeechRequest) -> float:
@@ -951,24 +999,39 @@ async def process_audio(
     SAMAudio, LFM2.5-Audio), and returns WAV bytes of the processed audio.
     """
     from omlx.engine.sts import STSEngine
-    from omlx.exceptions import ModelNotFoundError
+    from omlx.engine.voicechat import VoiceChatBusyError, VoiceChatEngine
+    from omlx.exceptions import ModelBusyError, ModelNotFoundError
 
     pool = _get_engine_pool()
     resolved_model = _resolve_model(model)
+    get_entry = getattr(pool, "get_entry", None)
+    entry = get_entry(resolved_model) if callable(get_entry) else None
+    voicechat_metadata = _is_voicechat_metadata(entry)
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
         engine = await pool.get_engine(resolved_model)
+    except VoiceChatBusyError as exc:
+        return _voicechat_busy_response(exc)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
             detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
+    except ModelBusyError as exc:
+        if voicechat_metadata:
+            return _voicechat_busy_response(exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    if not isinstance(engine, STSEngine):
+    is_voicechat = (
+        voicechat_metadata
+        or isinstance(engine, VoiceChatEngine)
+        or _is_voicechat_metadata(engine)
+    )
+    if not is_voicechat and not isinstance(engine, STSEngine):
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",
@@ -983,11 +1046,20 @@ async def process_audio(
     tmp_path = None
     try:
         content = await _read_upload(file)
+        if not content:
+            raise HTTPException(status_code=400, detail="Audio file is empty")
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             tmp.write(content)
 
         wav_bytes = await engine.process(tmp_path)
+        wav_bytes = _validate_wav_output(wav_bytes)
+    except VoiceChatBusyError as exc:
+        return _voicechat_busy_response(exc)
+    except ModelBusyError as exc:
+        if is_voicechat:
+            return _voicechat_busy_response(exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except HTTPException:
         raise
     except Exception as exc:

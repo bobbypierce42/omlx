@@ -8,13 +8,14 @@ All unit tests run with mocked STSEngine and EnginePool — mlx-audio is not
 required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
+import asyncio
 import io
+import os
 import wave
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
 
 # ---------------------------------------------------------------------------
 # WAV fixture helpers
@@ -38,26 +39,41 @@ RIFF_MAGIC = b"RIFF"
 
 
 # ---------------------------------------------------------------------------
-# Mock STSEngine and EnginePool
+# Mock STS/VoiceChat engines and EnginePool
 # ---------------------------------------------------------------------------
 
 
 def _make_mock_sts_engine(output_wav: bytes = None) -> MagicMock:
     """Build a mock STSEngine that returns the given WAV bytes."""
     from omlx.engine.sts import STSEngine
+
     engine = MagicMock(spec=STSEngine)
     engine.process = AsyncMock(return_value=output_wav or TINY_WAV)
     return engine
 
 
-def _make_mock_pool(sts_engine=None, model_id: str = "deepfilternet") -> MagicMock:
+def _make_mock_voicechat_engine(output_wav: bytes = None) -> MagicMock:
+    """Build a mock VoiceChatEngine that returns the given WAV bytes."""
+    from omlx.engine.voicechat import VoiceChatEngine
+
+    engine = MagicMock(spec=VoiceChatEngine)
+    engine.process = AsyncMock(return_value=output_wav or TINY_WAV)
+    return engine
+
+
+def _make_mock_pool(
+    sts_engine=None,
+    model_id: str = "deepfilternet",
+    entry=None,
+) -> MagicMock:
     """Build a mock EnginePool that returns the given STS engine."""
     pool = MagicMock()
     pool.get_engine = AsyncMock(return_value=sts_engine or _make_mock_sts_engine())
-    pool.get_entry = MagicMock(return_value=MagicMock(
-        model_type="audio_sts",
-        engine_type="audio_sts",
-    ))
+    pool.get_entry = MagicMock(
+        return_value=entry
+        if entry is not None
+        else MagicMock(model_type="audio_sts", engine_type="audio_sts")
+    )
     pool.get_model_ids.return_value = [model_id]
     pool.preload_pinned_models = AsyncMock()
     pool.check_ttl_expirations = AsyncMock()
@@ -121,6 +137,36 @@ def audio_sts_client():
     with patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool):
         with TestClient(app, raise_server_exceptions=False) as client:
             yield client, mock_pool
+
+
+@pytest.fixture
+def voicechat_client():
+    """Minimal TestClient using a mocked VoiceChat engine and pool."""
+    from fastapi import FastAPI
+
+    from omlx.api.audio_routes import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    voicechat = _make_mock_voicechat_engine()
+    entry = MagicMock(
+        model_type="audio_sts",
+        engine_type="voicechat",
+        realtime_voicechat=True,
+    )
+    mock_pool = _make_mock_pool(
+        voicechat,
+        model_id="voicechat",
+        entry=entry,
+    )
+
+    with (
+        patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool),
+        patch("omlx.api.audio_routes._resolve_model", side_effect=lambda model: model),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        yield client, mock_pool, voicechat
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +251,136 @@ class TestSTSEndpointBasic:
                 data={"model": model_name},
             )
             assert response.status_code == 200
+
+
+class TestVoiceChatEndpoint:
+    """VoiceChat-specific dispatch and lifecycle behavior."""
+
+    def test_voicechat_process_returns_playable_wav(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/wav"
+        with wave.open(io.BytesIO(response.content), "rb") as output:
+            assert output.getnchannels() == 1
+            assert output.getframerate() == 16000
+            assert output.getnframes() > 0
+        voicechat.process.assert_awaited_once()
+        temp_path = voicechat.process.await_args.args[0]
+        assert not os.path.exists(temp_path)
+
+    def test_empty_audio_is_rejected_before_inference(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("empty.wav", b"", "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code == 400
+        voicechat.process.assert_not_awaited()
+
+    def test_invalid_audio_error_is_not_successful(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        voicechat.process.side_effect = ValueError("invalid audio")
+
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("recorded.wav", b"not-audio", "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code >= 400
+
+    def test_voicechat_load_failure_returns_server_error(self, voicechat_client):
+        client, pool, _ = voicechat_client
+        pool.get_engine.side_effect = RuntimeError("voicechat load failed")
+
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code >= 500
+
+    def test_voicechat_busy_returns_retryable_503(self, voicechat_client):
+        from omlx.engine.voicechat import VoiceChatBusyError
+
+        client, _, voicechat = voicechat_client
+        voicechat.process.side_effect = VoiceChatBusyError()
+
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "1"
+        error = response.json()["error"]
+        assert error["code"] == "busy"
+        assert error["retryable"] is True
+
+    def test_client_disconnect_cleans_uploaded_tempfile(self):
+        from fastapi import UploadFile
+
+        from omlx.api.audio_routes import process_audio
+
+        voicechat = _make_mock_voicechat_engine()
+        pool = _make_mock_pool(
+            voicechat,
+            model_id="voicechat",
+            entry=MagicMock(
+                model_type="audio_sts",
+                engine_type="voicechat",
+                realtime_voicechat=True,
+            ),
+        )
+        started = asyncio.Event()
+        state = {}
+
+        async def blocked_process(audio_path):
+            state["path"] = audio_path
+            started.set()
+            await asyncio.Future()
+
+        voicechat.process.side_effect = blocked_process
+
+        async def run_request():
+            with (
+                patch("omlx.api.audio_routes._get_engine_pool", return_value=pool),
+                patch(
+                    "omlx.api.audio_routes._resolve_model",
+                    side_effect=lambda model: model,
+                ),
+            ):
+                upload = UploadFile(file=io.BytesIO(TINY_WAV), filename="audio.wav")
+                request = asyncio.create_task(process_audio(upload, "voicechat"))
+                await started.wait()
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+
+        asyncio.run(run_request())
+        assert not os.path.exists(state["path"])
+
+    def test_invalid_engine_output_returns_server_error(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        voicechat.process.return_value = b"not-a-wav"
+
+        response = client.post(
+            "/v1/audio/process",
+            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+            data={"model": "voicechat"},
+        )
+
+        assert response.status_code >= 500
 
 
 # ---------------------------------------------------------------------------

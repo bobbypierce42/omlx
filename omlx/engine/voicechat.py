@@ -11,7 +11,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from functools import partial
 from pathlib import Path
@@ -272,6 +272,34 @@ def normalize_voicechat_events(events: Any) -> list[VoiceChatEvent]:
     if isinstance(events, (dict, VoiceChatEvent)) or hasattr(events, "kind"):
         events = [events]
     return [normalize_voicechat_event(event) for event in events]
+
+
+def _materialize_cpu_array(value: Any) -> Any:
+    """Copy an MLX output to NumPy while still on the MLX executor thread."""
+    if not isinstance(value, mx.array):
+        return value
+    if value.dtype == mx.bfloat16:
+        value = value.astype(mx.float32)
+    return np.array(value)
+
+
+def _materialize_voicechat_events(events: Any) -> list[VoiceChatEvent]:
+    """Normalize events and detach their MLX audio payloads on the worker."""
+    return [
+        replace(
+            event,
+            samples=_materialize_cpu_array(event.samples),
+            audio_codes=_materialize_cpu_array(event.audio_codes),
+        )
+        for event in normalize_voicechat_events(events)
+    ]
+
+
+def _invoke_and_materialize_events(
+    method: Callable[..., Any], *args: Any, **kwargs: Any
+) -> list[VoiceChatEvent]:
+    """Run a model event method and materialize output on its worker thread."""
+    return _materialize_voicechat_events(method(*args, **kwargs))
 
 
 def _load_voicechat_components(model_name: str):
@@ -662,20 +690,27 @@ class VoiceChatEngine(BaseNonStreamingEngine):
         session = self._session
         assert session is not None
         loop = asyncio.get_running_loop()
+
+        def _generate_sync() -> tuple[Any, Any]:
+            result = session.generate(str(audio_path), **kwargs)
+            return (
+                _materialize_cpu_array(_event_value(result, "audio")),
+                _event_value(result, "sample_rate", self.output_sample_rate),
+            )
+
         operation = loop.run_in_executor(
-            get_mlx_executor(), partial(session.generate, str(audio_path), **kwargs)
+            get_mlx_executor(), _generate_sync
         )
         reservation.operation = operation
         try:
-            result = await asyncio.shield(operation)
+            audio, result_sample_rate = await asyncio.shield(operation)
             reservation.operation = None
-            audio = _event_value(result, "audio")
             if not _has_audio_samples(audio):
                 raise VoiceChatInferenceError(
                     "VoiceChat model produced no audio output"
                 )
             sample_rate = int(
-                _event_value(result, "sample_rate", self.output_sample_rate)
+                result_sample_rate
                 or self.output_sample_rate
             )
             output = audio_to_wav_bytes(audio, sample_rate)
@@ -811,7 +846,7 @@ class VoiceChatRealtimeSession:
         method = getattr(raw_session, method_name)
         loop = asyncio.get_running_loop()
         operation = loop.run_in_executor(
-            get_mlx_executor(), partial(method, *args, **kwargs)
+            get_mlx_executor(), partial(_invoke_and_materialize_events, method, *args, **kwargs)
         )
         self._operation = operation
         self._reservation.operation = operation

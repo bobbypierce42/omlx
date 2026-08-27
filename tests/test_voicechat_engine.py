@@ -9,8 +9,11 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import mlx.core as mx
+import numpy as np
 import pytest
 
+import omlx.engine.voicechat as voicechat_module
 from omlx.engine.voicechat import (
     VoiceChatBusyError,
     VoiceChatEngine,
@@ -21,6 +24,23 @@ from omlx.engine.voicechat import (
     normalize_voicechat_events,
 )
 from omlx.engine_pool import EngineEntry, EnginePool
+
+
+class _ExecutorOnlyArray:
+    dtype = mx.float32
+
+    def __init__(self, values):
+        self._values = values
+        self.size = len(values)
+
+    def __len__(self):
+        return self.size
+
+    def __array__(self, dtype=None, copy=None):
+        if not threading.current_thread().name.startswith("mlx-global"):
+            raise AssertionError("MLX output was converted outside the executor")
+        result = np.asarray(self._values, dtype=dtype)
+        return result.copy() if copy else result
 
 
 class FakeStreamingSession:
@@ -296,6 +316,60 @@ async def test_offline_no_audio_and_backend_errors_are_structured():
     with pytest.raises(VoiceChatInferenceError, match="backend failed"):
         await engine.process("input.wav")
     await engine.stop()
+
+
+def test_event_normalization_does_not_convert_remaining_mlx_arrays():
+    samples = _ExecutorOnlyArray([0.0, 0.25])
+
+    normalized = normalize_voicechat_events(
+        [SimpleNamespace(kind="audio", samples=samples)]
+    )
+
+    assert normalized[0].samples is samples
+
+
+@pytest.mark.asyncio
+async def test_realtime_audio_and_codes_are_materialized_on_mlx_executor():
+    raw = FakeStreamingSession()
+    raw.events = [
+        SimpleNamespace(
+            kind="audio",
+            frame_index=0,
+            samples=_ExecutorOnlyArray([0.0, 0.25]),
+            sample_rate=22_050,
+            audio_codes=_ExecutorOnlyArray([1, 2]),
+        )
+    ]
+    engine, _, _ = await _make_engine(raw)
+
+    with patch.object(voicechat_module.mx, "array", _ExecutorOnlyArray):
+        try:
+            session = await engine.create_realtime_session()
+            events = await session.push_audio([0.0])
+        finally:
+            await engine.stop()
+
+    assert isinstance(events[0].samples, np.ndarray)
+    assert isinstance(events[0].audio_codes, np.ndarray)
+
+
+@pytest.mark.asyncio
+async def test_offline_audio_is_materialized_before_wav_encoding():
+    raw = FakeStreamingSession()
+    model_session = FakeModelSession(raw)
+    model_session.generate_result = SimpleNamespace(
+        audio=_ExecutorOnlyArray([0.0, 0.25, -0.25]),
+        sample_rate=22_050,
+    )
+    engine, _, _ = await _make_engine(raw, session=model_session)
+
+    with patch.object(voicechat_module.mx, "array", _ExecutorOnlyArray):
+        try:
+            output = await engine.process("input.wav")
+        finally:
+            await engine.stop()
+
+    assert output[:4] == b"RIFF"
 
 
 @pytest.mark.asyncio

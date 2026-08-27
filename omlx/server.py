@@ -154,6 +154,7 @@ from .api.responses_utils import (
     format_sse_event,
     normalize_response_output_to_messages,
 )
+from .api.realtime_routes import realtime_router as voicechat_realtime_router
 from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
 from .api.tool_calling import (
     ToolCallStreamFilter,
@@ -637,6 +638,11 @@ try:
     del _
 except ImportError:
     pass
+
+# VoiceChat is supplied by mlx-vlm and has its own full-duplex protocol. Keep
+# this route independent from the optional mlx-audio HTTP routes so a VoiceChat
+# checkpoint can still expose /v1/realtime when only its required extra exists.
+app.include_router(voicechat_realtime_router)
 
 # Include admin routes
 from .admin.auth import _RedirectToLogin, require_admin

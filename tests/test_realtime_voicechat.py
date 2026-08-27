@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -94,6 +97,8 @@ def test_official_style_fixture_streams_voicechat_events():
                 token_id=43,
                 delta="{",
                 text="{",
+                call_id="call_lookup",
+                function_name="lookup",
             ),
             VoiceChatEvent(
                 kind="audio",
@@ -123,7 +128,11 @@ def test_official_style_fixture_streams_voicechat_events():
                 }
             )
             assert websocket.receive_json()["type"] == "response.text.delta"
-            assert websocket.receive_json()["type"] == "response.function.delta"
+            function = websocket.receive_json()
+            assert function["type"] == "response.function_call_arguments.delta"
+            assert function["call_id"] == "call_lookup"
+            assert function["name"] == "lookup"
+            assert function["arguments"] == "{"
             audio = websocket.receive_json()
             assert audio["type"] == "response.audio.delta"
             assert audio["sample_rate"] == 22_050
@@ -133,6 +142,10 @@ def test_official_style_fixture_streams_voicechat_events():
 
             websocket.send_json({"type": "input_audio_buffer.commit"})
             assert websocket.receive_json()["type"] == "input_audio_buffer.committed"
+            assert (
+                websocket.receive_json()["type"]
+                == "response.function_call_arguments.done"
+            )
             assert websocket.receive_json()["type"] == "response.done"
         finally:
             websocket.__exit__(None, None, None)
@@ -141,6 +154,90 @@ def test_official_style_fixture_streams_voicechat_events():
         seed=7,
         max_streaming_seconds=None,
     )
+
+
+def test_function_channel_emits_stable_structured_call_events():
+    session = _StubStreamingSession(
+        [
+            SimpleNamespace(
+                kind="function_delta",
+                frame_index=0,
+                token_id=1,
+                delta="{",
+                text="{",
+                call_id="call_weather",
+                function_name="weather",
+            ),
+            SimpleNamespace(
+                kind="function_delta",
+                frame_index=0,
+                token_id=2,
+                delta='"city":"Paris"}',
+                text='{"city":"Paris"}',
+                call_id="call_weather",
+                function_name="weather",
+            ),
+        ]
+    )
+    patches, client, _ = _client(session)
+    with patches[0], patches[1], patches[2], client:
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            pcm = np.zeros(1_280, dtype="<i2").tobytes()
+            websocket.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
+            first = websocket.receive_json()
+            second = websocket.receive_json()
+            assert first["type"] == "response.function_call_arguments.delta"
+            assert second["type"] == "response.function_call_arguments.delta"
+            assert first["call_id"] == second["call_id"] == "call_weather"
+            assert first["item_id"] == second["item_id"]
+            assert first["response_id"] == second["response_id"]
+            assert first["name"] == second["name"] == "weather"
+            assert second["arguments"] == '{"city":"Paris"}'
+
+            websocket.send_json({"type": "input_audio_buffer.commit"})
+            assert websocket.receive_json()["type"] == "input_audio_buffer.committed"
+            done = websocket.receive_json()
+            assert done["type"] == "response.function_call_arguments.done"
+            assert done["call_id"] == "call_weather"
+            assert done["name"] == "weather"
+            assert done["arguments"] == '{"city":"Paris"}'
+            assert websocket.receive_json()["type"] == "response.done"
+        finally:
+            websocket.__exit__(None, None, None)
+
+
+def test_parallel_function_call_emits_unsupported_operation():
+    session = _StubStreamingSession(
+        [
+            VoiceChatEvent(
+                kind="function_delta",
+                delta="{",
+                parallel=True,
+            )
+        ]
+    )
+    patches, client, _ = _client(session)
+    with patches[0], patches[1], patches[2], client:
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            pcm = np.zeros(1_280, dtype="<i2").tobytes()
+            websocket.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
+            error = websocket.receive_json()
+            assert error["type"] == "error"
+            assert error["error"]["code"] == "unsupported_operation"
+        finally:
+            websocket.__exit__(None, None, None)
 
 
 def test_invalid_bearer_auth_is_rejected_without_starting_model():
@@ -163,6 +260,174 @@ def test_invalid_bearer_auth_is_rejected_without_starting_model():
         assert error["type"] == "error"
         assert error["error"]["code"] == "invalid_api_key"
     engine.create_realtime_session.assert_not_awaited()
+
+
+@pytest.mark.parametrize("sample_rate", [0, 12_345])
+def test_invalid_append_sample_rates_are_rejected_before_model_work(sample_rate):
+    session = _StubStreamingSession()
+    patches, client, _ = _client(session)
+    with patches[0], patches[1], patches[2], client:
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            pcm = np.zeros(1_280, dtype="<i2").tobytes()
+            websocket.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                    "sample_rate": sample_rate,
+                }
+            )
+            error = websocket.receive_json()
+            assert error["type"] == "error"
+            assert error["error"]["param"] == "sample_rate"
+            assert session.push_lengths == []
+        finally:
+            websocket.send_json({"type": "response.cancel"})
+            assert websocket.receive_json()["type"] == "response.cancelled"
+            websocket.__exit__(None, None, None)
+
+
+def test_oversized_text_is_rejected_before_json_parsing():
+    import omlx.api.realtime_routes as routes
+
+    oversized = "{" + ("x" * routes._MAX_INBOUND_TEXT_BYTES)
+    with (
+        patch.object(routes.json, "loads", side_effect=AssertionError("parsed")),
+        pytest.raises(routes._RealtimeProtocolError, match="maximum"),
+    ):
+        routes._parse_json_text(oversized)
+
+
+def test_tool_extras_are_canonicalized_and_bounded():
+    import omlx.api.realtime_routes as routes
+
+    valid = routes._validate_tools(
+        [
+            {
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object"},
+                "unbounded_extra": {"nested": {"ignored": True}},
+            }
+        ]
+    )
+    assert valid == [
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+    ]
+    with pytest.raises(routes._RealtimeProtocolError, match="too large"):
+        routes._validate_tools(
+            [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "parameters": {
+                        "description": "x" * (routes._MAX_TOOL_STRING_BYTES + 1)
+                    },
+                }
+            ]
+        )
+
+
+def test_tools_are_rejected_when_engine_cannot_apply_them():
+    import omlx.api.realtime_routes as routes
+
+    tool = {
+        "type": "function",
+        "name": "lookup",
+        "parameters": {"type": "object"},
+    }
+    settings = routes._validate_session_settings(
+        {"model": "fake-voicechat", "tools": [tool]}, model_hint=None
+    )
+
+    class _NoToolsEngine:
+        def __init__(self):
+            self.calls = 0
+
+        async def create_realtime_session(
+            self, *, system_prompt=None, seed=0, max_streaming_seconds=None
+        ):
+            del system_prompt, seed, max_streaming_seconds
+            self.calls += 1
+            return _StubStreamingSession()
+
+    engine = _NoToolsEngine()
+    pool = SimpleNamespace(
+        get_entry=lambda _model: None,
+        get_engine=AsyncMock(return_value=engine),
+    )
+    with (
+        patch(
+            "omlx.api.realtime_routes._resolve_model", side_effect=lambda value: value
+        ),
+        pytest.raises(routes._RealtimeProtocolError, match="cannot apply") as exc_info,
+    ):
+        asyncio.run(routes._open_runtime(pool, settings, "sess_test"))
+    assert exc_info.value.code == "unsupported_operation"
+    assert engine.calls == 0
+
+
+def test_tools_are_passed_when_engine_exposes_a_tools_parameter():
+    import omlx.api.realtime_routes as routes
+
+    tool = {
+        "type": "function",
+        "name": "lookup",
+        "description": "Find a record",
+        "parameters": {"type": "object"},
+        "ignored": {"deep": {"value": True}},
+    }
+    settings = routes._validate_session_settings(
+        {"model": "fake-voicechat", "tools": [tool]}, model_hint=None
+    )
+
+    class _ToolsEngine:
+        def __init__(self):
+            self.tools = None
+
+        async def create_realtime_session(
+            self, *, system_prompt=None, seed=0, max_streaming_seconds=None, tools=None
+        ):
+            del system_prompt, seed, max_streaming_seconds
+            self.tools = tools
+            return _StubStreamingSession()
+
+    engine = _ToolsEngine()
+    pool = SimpleNamespace(
+        get_entry=lambda _model: None,
+        get_engine=AsyncMock(return_value=engine),
+    )
+    with patch(
+        "omlx.api.realtime_routes._resolve_model", side_effect=lambda value: value
+    ):
+        runtime = asyncio.run(routes._open_runtime(pool, settings, "sess_test"))
+        asyncio.run(routes._close_runtime(runtime))
+    assert engine.tools == [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Find a record",
+            "parameters": {"type": "object"},
+        }
+    ]
+
+
+def test_response_create_is_rejected_instead_of_being_silent():
+    session = _StubStreamingSession()
+    patches, client, _ = _client(session)
+    with patches[0], patches[1], patches[2], client:
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            websocket.send_json({"type": "response.create"})
+            error = websocket.receive_json()
+            assert error["type"] == "error"
+            assert error["error"]["code"] == "unsupported_operation"
+            assert session.push_lengths == []
+            assert session.flush_calls == []
+        finally:
+            websocket.send_json({"type": "response.cancel"})
+            assert websocket.receive_json()["type"] == "response.cancelled"
+            websocket.__exit__(None, None, None)
 
 
 def test_invalid_session_update_can_be_corrected_before_model_work():
@@ -213,12 +478,53 @@ def test_large_resampled_chunk_is_split_into_native_frames():
                     "sample_rate": 24_000,
                 }
             )
+            deadline = time.monotonic() + 1
+            while len(session.push_lengths) < 3 and time.monotonic() < deadline:
+                time.sleep(0.01)
             websocket.send_json({"type": "response.cancel"})
             assert websocket.receive_json()["type"] == "response.cancelled"
         finally:
             websocket.__exit__(None, None, None)
     assert session.push_lengths == [1_280, 1_280, 1_280]
     assert session.push_rates == [16_000, 16_000, 16_000]
+
+
+def test_response_cancel_preempts_a_large_append():
+    started = threading.Event()
+    cancelled = threading.Event()
+    push_calls: list[int] = []
+
+    class _SlowSession(_StubStreamingSession):
+        async def push_audio(self, samples, *, sample_rate):
+            push_calls.append(len(samples))
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return []
+
+    session = _SlowSession()
+    patches, client, _ = _client(session)
+    with patches[0], patches[1], patches[2], client:
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            pcm = np.zeros(1_280 * 100, dtype="<i2").tobytes()
+            websocket.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
+            assert started.wait(1)
+            websocket.send_json({"type": "response.cancel"})
+            assert websocket.receive_json()["type"] == "response.cancelled"
+        finally:
+            websocket.__exit__(None, None, None)
+    assert cancelled.is_set()
+    assert push_calls == [1_280]
+    assert session.cancel_calls == 1
 
 
 def test_duplicate_event_id_and_tool_result_are_rejected():
@@ -356,6 +662,31 @@ def test_audio_serializer_preserves_native_output_metadata():
     assert payload["format"] == "pcm16"
     assert payload["channels"] == 1
     assert payload["audio_codes"] == list(range(31))
+
+
+def test_backend_error_redacts_credentials_before_sending():
+    import omlx.api.realtime_routes as routes
+
+    class _WebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+    websocket = _WebSocket()
+    asyncio.run(
+        routes._send_error(
+            websocket,
+            "backend failed Authorization: Bearer super-secret-token "
+            "api_key=another-secret sk-1234567890abcdef",
+        )
+    )
+    serialized = json.dumps(websocket.sent)
+    assert "super-secret-token" not in serialized
+    assert "another-secret" not in serialized
+    assert "sk-1234567890abcdef" not in serialized
+    assert "redacted" in serialized
 
 
 def test_session_content_is_not_written_to_trace_logs(caplog):

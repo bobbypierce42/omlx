@@ -75,6 +75,10 @@ class VoiceChatEvent:
     samples: Any | None = None
     sample_rate: int | None = None
     audio_codes: Any | None = None
+    call_id: str | None = None
+    function_name: str | None = None
+    arguments: str | None = None
+    parallel: bool = False
     error: str | None = None
     code: str | None = None
     retryable: bool = False
@@ -92,12 +96,16 @@ class VoiceChatEvent:
             "samples",
             "sample_rate",
             "audio_codes",
+            "call_id",
+            "function_name",
+            "arguments",
+            "parallel",
             "error",
             "code",
             "retryable",
         ):
             value = getattr(self, name)
-            if value is not None and (name != "retryable" or value):
+            if value is not None and (name not in {"retryable", "parallel"} or value):
                 result[name] = value
         return result
 
@@ -228,9 +236,9 @@ def normalize_voicechat_event(event: Any) -> VoiceChatEvent:
         )
 
     samples = _event_value(event, "samples")
+    sample_rate = _event_value(event, "sample_rate")
     if normalized_kind is VoiceChatEventKind.AUDIO and not _has_audio_samples(samples):
         return _error_event("VoiceChat model produced no audio output", code="no_audio")
-    sample_rate = _event_value(event, "sample_rate")
     if normalized_kind is VoiceChatEventKind.AUDIO and sample_rate is None:
         sample_rate = VOICECHAT_OUTPUT_SAMPLE_RATE
 
@@ -243,6 +251,14 @@ def normalize_voicechat_event(event: Any) -> VoiceChatEvent:
         samples=samples,
         sample_rate=sample_rate,
         audio_codes=_event_value(event, "audio_codes"),
+        call_id=_event_value(event, "call_id", _event_value(event, "function_call_id")),
+        function_name=_event_value(event, "function_name", _event_value(event, "name")),
+        arguments=_event_value(event, "arguments"),
+        parallel=bool(
+            _event_value(
+                event, "parallel", _event_value(event, "parallel_tool_calls", False)
+            )
+        ),
         error=_event_value(event, "error", _event_value(event, "message")),
         code=_event_value(event, "code"),
         retryable=bool(_event_value(event, "retryable", False)),

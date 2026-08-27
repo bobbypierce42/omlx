@@ -13,7 +13,7 @@ import math
 import re
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -44,7 +44,13 @@ realtime_router = APIRouter()
 _AUTH_TIMEOUT_SECONDS = 10.0
 _MAX_AUDIO_BYTES = 15 * 1024 * 1024
 _MAX_AUDIO_BASE64_BYTES = 20 * 1024 * 1024
+_MAX_INBOUND_TEXT_BYTES = 22 * 1024 * 1024
+_MAX_TOOL_PAYLOAD_BYTES = 64 * 1024
+_MAX_TOOL_JSON_DEPTH = 24
+_MAX_TOOL_CONTAINER_ITEMS = 1024
+_MAX_TOOL_STRING_BYTES = 16 * 1024
 _MAX_QUEUED_MESSAGES = 32
+_MAX_RESAMPLE_INPUT_SAMPLES = 4096
 _BUSY_CLOSE_CODE = 1013
 _AUTH_CLOSE_CODE = 1008
 _SERVER_CLOSE_CODE = 1011
@@ -53,6 +59,12 @@ _SUPPORTED_SAMPLE_RATES = frozenset(
 )
 _SUPPORTED_PCM_FORMATS = frozenset({"pcm16", "audio/pcm", "audio/x-pcm", "s16le"})
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+_NAMED_SECRET_RE = re.compile(
+    r"(?i)\b(api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|credential|token|key)"
+    r"\s*[:=]\s*(?:bearer\s+)?[^\s,;}\]]+"
+)
+_TOKEN_SECRET_RE = re.compile(r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
 
 
 class _RealtimeProtocolError(ValueError):
@@ -85,6 +97,15 @@ class _SessionSettings:
 
 
 @dataclass
+class _FunctionCallState:
+    call_id: str
+    item_id: str
+    response_id: str
+    name: str
+    arguments: str = ""
+
+
+@dataclass
 class _RealtimeRuntime:
     session: Any
     engine: Any
@@ -95,6 +116,10 @@ class _RealtimeRuntime:
     frame_samples: int
     input_resampler: _StreamingLinearResampler
     received_audio: bool = False
+    pending_native_samples: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float32)
+    )
+    function_call: _FunctionCallState | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +127,14 @@ class _InboundMessage:
     payload: dict[str, Any] | None = None
     binary: bytes | None = None
     error: str | None = None
+    error_code: str = "invalid_request"
+    error_param: str | None = None
+
+
+@dataclass
+class _RealtimeControl:
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    cancel_payload: dict[str, Any] | None = None
 
 
 class _StreamingLinearResampler:
@@ -175,6 +208,11 @@ def _new_session_id() -> str:
 
 def _safe_message(value: Any, fallback: str = "realtime request failed") -> str:
     message = str(value).replace("\r", " ").replace("\n", " ").strip()
+    message = _BEARER_SECRET_RE.sub("Bearer <redacted>", message)
+    message = _NAMED_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=<redacted>", message
+    )
+    message = _TOKEN_SECRET_RE.sub("<redacted>", message)
     return (message[:500] or fallback)[:500]
 
 
@@ -182,6 +220,68 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _parse_json_text(text: Any) -> dict[str, Any]:
+    if not isinstance(text, str):
+        raise _RealtimeProtocolError("message must be a JSON object")
+    if len(text.encode("utf-8")) > _MAX_INBOUND_TEXT_BYTES:
+        raise _RealtimeProtocolError(
+            "message exceeds the maximum allowed size", param="message"
+        )
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError, RecursionError, MemoryError) as exc:
+        raise _RealtimeProtocolError("message must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise _RealtimeProtocolError("message must be a JSON object")
+    return payload
+
+
+def _check_json_bounds(
+    value: Any,
+    path: str,
+    *,
+    depth: int = 0,
+    max_depth: int = _MAX_TOOL_JSON_DEPTH,
+    max_items: int = _MAX_TOOL_CONTAINER_ITEMS,
+    max_string_bytes: int = _MAX_TOOL_STRING_BYTES,
+) -> None:
+    if depth > max_depth:
+        raise _RealtimeProtocolError("nested JSON payload is too deep", param=path)
+    if isinstance(value, str):
+        if len(value.encode("utf-8")) > max_string_bytes:
+            raise _RealtimeProtocolError("nested JSON string is too large", param=path)
+        return
+    if isinstance(value, dict):
+        if len(value) > max_items:
+            raise _RealtimeProtocolError(
+                "nested JSON object has too many fields", param=path
+            )
+        for index, item in enumerate(value.values()):
+            _check_json_bounds(
+                item,
+                f"{path}[{index}]",
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string_bytes=max_string_bytes,
+            )
+        return
+    if isinstance(value, list):
+        if len(value) > max_items:
+            raise _RealtimeProtocolError(
+                "nested JSON array has too many items", param=path
+            )
+        for index, item in enumerate(value):
+            _check_json_bounds(
+                item,
+                f"{path}[{index}]",
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string_bytes=max_string_bytes,
+            )
 
 
 def _get_engine_pool():
@@ -334,6 +434,21 @@ def _validate_tools(value: Any) -> list[dict[str, Any]]:
         param = f"session.tools[{index}]"
         if not isinstance(tool, dict):
             raise _RealtimeProtocolError("tool must be an object", param=param)
+        try:
+            tool_size = len(
+                json.dumps(tool, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+        except (TypeError, ValueError, RecursionError, MemoryError) as exc:
+            raise _RealtimeProtocolError(
+                "tool definition must be a bounded JSON object", param=param
+            ) from exc
+        if tool_size > _MAX_TOOL_PAYLOAD_BYTES:
+            raise _RealtimeProtocolError(
+                "tool definition exceeds the maximum allowed size", param=param
+            )
+        _check_json_bounds(tool, param)
         if tool.get("type", "function") != "function":
             raise _RealtimeProtocolError(
                 "only function tools are supported", param=f"{param}.type"
@@ -361,7 +476,21 @@ def _validate_tools(value: Any) -> list[dict[str, Any]]:
                     f"tool {field_name} must be a string",
                     param=f"{param}.{field_name}",
                 )
-        validated.append(tool)
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise _RealtimeProtocolError(
+                "tool strict must be a boolean", param=f"{param}.strict"
+            )
+        normalized: dict[str, Any] = {
+            "type": "function",
+            "name": name,
+            "parameters": parameters,
+        }
+        if "description" in function:
+            normalized["description"] = function["description"]
+        if strict is not None:
+            normalized["strict"] = strict
+        validated.append(normalized)
     return validated
 
 
@@ -657,12 +786,18 @@ def _serialize_model_event(
             "text": event.text,
         }
     if kind == VoiceChatEventKind.FUNCTION.value:
+        call_id = getattr(event, "call_id", None)
+        function_name = getattr(event, "function_name", None)
+        arguments = getattr(event, "arguments", None)
         return {
-            "type": "response.function.delta",
+            "type": "response.function_call_arguments.delta",
             **common,
             "token_id": event.token_id,
+            "call_id": call_id or "call_unknown",
+            "item_id": "item_unknown",
+            "name": function_name or "voicechat_function",
             "delta": event.delta,
-            "text": event.text,
+            "arguments": arguments or event.text or event.delta or "",
         }
     if kind == VoiceChatEventKind.TRANSCRIPT.value:
         return {
@@ -673,7 +808,15 @@ def _serialize_model_event(
         }
     if kind == VoiceChatEventKind.AUDIO.value:
         samples = np.asarray(event.samples, dtype=np.float32).reshape(-1)
-        source_rate = int(event.sample_rate or VOICECHAT_OUTPUT_SAMPLE_RATE)
+        source_rate = int(
+            event.sample_rate
+            if event.sample_rate is not None
+            else VOICECHAT_OUTPUT_SAMPLE_RATE
+        )
+        if source_rate not in _SUPPORTED_SAMPLE_RATES:
+            raise _RealtimeProtocolError(
+                "unsupported output sample rate", param="sample_rate"
+            )
         if source_rate != output_sample_rate and samples.size:
             output_length = max(
                 1, round(samples.size * output_sample_rate / source_rate)
@@ -741,6 +884,56 @@ def _entry_is_voicechat(entry: Any) -> bool | None:
     return engine_type == "voicechat" or is_voicechat is True or capability is True
 
 
+def _session_create_kwargs(
+    engine: Any,
+    settings: _SessionSettings,
+) -> dict[str, Any]:
+    create = getattr(engine, "create_realtime_session", None)
+    if getattr(engine, "_spec_class", None) is VoiceChatEngine:
+        create = VoiceChatEngine.create_realtime_session
+    try:
+        parameters = inspect.signature(create).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+        accepts_arbitrary = True
+    else:
+        accepts_arbitrary = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
+    kwargs: dict[str, Any] = {}
+    if "system_prompt" in parameters or accepts_arbitrary:
+        kwargs["system_prompt"] = settings.system_prompt
+    elif "instructions" in parameters:
+        kwargs["instructions"] = settings.system_prompt
+    elif settings.system_prompt is not None:
+        raise _RealtimeProtocolError(
+            "this VoiceChat engine cannot apply session instructions",
+            code="unsupported_operation",
+            param="session.instructions",
+            close_code=_AUTH_CLOSE_CODE,
+        )
+
+    for name, value in (
+        ("seed", settings.seed),
+        ("max_streaming_seconds", settings.max_streaming_seconds),
+    ):
+        if name in parameters or accepts_arbitrary:
+            kwargs[name] = value
+
+    if settings.tools:
+        if "tools" not in parameters and not accepts_arbitrary:
+            raise _RealtimeProtocolError(
+                "this VoiceChat engine cannot apply session tools",
+                code="unsupported_operation",
+                param="session.tools",
+                close_code=_AUTH_CLOSE_CODE,
+            )
+        kwargs["tools"] = settings.tools
+    return kwargs
+
+
 async def _open_runtime(
     pool: Any,
     settings: _SessionSettings,
@@ -779,13 +972,10 @@ async def _open_runtime(
         )
 
     try:
-        session = await _maybe_await(
-            engine.create_realtime_session(
-                system_prompt=settings.system_prompt,
-                seed=settings.seed,
-                max_streaming_seconds=settings.max_streaming_seconds,
-            )
-        )
+        session_kwargs = _session_create_kwargs(engine, settings)
+        session = await _maybe_await(engine.create_realtime_session(**session_kwargs))
+    except _RealtimeProtocolError:
+        raise
     except VoiceChatBusyError:
         raise
     except Exception as exc:
@@ -802,21 +992,27 @@ async def _open_runtime(
             close_code=_SERVER_CLOSE_CODE,
         )
 
+    session_input_rate = getattr(session, "input_sample_rate", None)
+    if session_input_rate is None:
+        session_input_rate = getattr(engine, "input_sample_rate", None)
     native_input_rate = int(
-        getattr(session, "input_sample_rate", getattr(engine, "input_sample_rate", 0))
-        or VOICECHAT_INPUT_SAMPLE_RATE
+        VOICECHAT_INPUT_SAMPLE_RATE
+        if session_input_rate is None
+        else session_input_rate
     )
+    session_output_rate = getattr(session, "output_sample_rate", None)
+    if session_output_rate is None:
+        session_output_rate = getattr(engine, "output_sample_rate", None)
     native_output_rate = int(
-        getattr(session, "output_sample_rate", getattr(engine, "output_sample_rate", 0))
-        or VOICECHAT_OUTPUT_SAMPLE_RATE
+        VOICECHAT_OUTPUT_SAMPLE_RATE
+        if session_output_rate is None
+        else session_output_rate
     )
+    raw_frame_samples = getattr(session, "frame_samples", None)
     frame_samples = int(
-        getattr(
-            session,
-            "frame_samples",
-            native_input_rate * VOICECHAT_FRAME_DURATION_MS // 1000,
-        )
-        or native_input_rate * VOICECHAT_FRAME_DURATION_MS // 1000
+        native_input_rate * VOICECHAT_FRAME_DURATION_MS // 1000
+        if raw_frame_samples is None
+        else raw_frame_samples
     )
     if native_input_rate != VOICECHAT_INPUT_SAMPLE_RATE:
         with contextlib.suppress(Exception):
@@ -866,21 +1062,13 @@ async def _receive_payload(websocket: WebSocket) -> dict[str, Any]:
         raise _RealtimeProtocolError("handshake timeout", code="timeout") from exc
     if message.get("type") == "websocket.disconnect":
         raise WebSocketDisconnect(message.get("code", 1000))
-    text = message.get("text")
-    if not text:
-        raise _RealtimeProtocolError("message must be a JSON object")
-    try:
-        payload = json.loads(text)
-    except (TypeError, ValueError) as exc:
-        raise _RealtimeProtocolError("message must be valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise _RealtimeProtocolError("message must be a JSON object")
-    return payload
+    return _parse_json_text(message.get("text"))
 
 
 async def _read_messages(
     websocket: WebSocket,
     queue: asyncio.Queue[_InboundMessage],
+    control: _RealtimeControl | None = None,
 ) -> None:
     def enqueue(message: _InboundMessage) -> bool:
         try:
@@ -888,6 +1076,15 @@ async def _read_messages(
         except asyncio.QueueFull:
             return False
         return True
+
+    def enqueue_error(error: _RealtimeProtocolError) -> bool:
+        return enqueue(
+            _InboundMessage(
+                error=str(error),
+                error_code=error.code,
+                error_param=error.param,
+            )
+        )
 
     try:
         while True:
@@ -905,14 +1102,18 @@ async def _read_messages(
                     return
                 continue
             try:
-                payload = json.loads(text)
-            except (TypeError, ValueError):
-                if not enqueue(_InboundMessage(error="message must be valid JSON")):
+                payload = _parse_json_text(text)
+            except _RealtimeProtocolError as exc:
+                if not enqueue_error(exc):
                     return
                 continue
-            if not isinstance(payload, dict):
-                if not enqueue(_InboundMessage(error="message must be a JSON object")):
-                    return
+            if control is not None and payload.get("type") in {
+                "session.cancel",
+                "response.cancel",
+            }:
+                if control.cancel_payload is None:
+                    control.cancel_payload = payload
+                control.cancel_event.set()
                 continue
             if not enqueue(_InboundMessage(payload=payload)):
                 return
@@ -980,11 +1181,123 @@ def _session_view(
     return session
 
 
+def _function_name(event: VoiceChatEvent, tools: list[dict[str, Any]]) -> str:
+    name = getattr(event, "function_name", None)
+    if isinstance(name, str) and _TOOL_NAME_RE.fullmatch(name):
+        return name
+    tool_names = [
+        tool["name"]
+        for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    ]
+    if len(tool_names) == 1:
+        return tool_names[0]
+    return "voicechat_function"
+
+
+def _function_call_id(event: VoiceChatEvent) -> str | None:
+    call_id = getattr(event, "call_id", None)
+    if call_id is None:
+        return None
+    if not isinstance(call_id, str) or not call_id or len(call_id) > 128:
+        raise _RealtimeProtocolError(
+            "VoiceChat emitted an invalid function call ID",
+            code="protocol",
+            param="call_id",
+        )
+    return call_id
+
+
+def _function_delta_payload(
+    runtime: _RealtimeRuntime,
+    event: VoiceChatEvent,
+) -> dict[str, Any]:
+    if getattr(event, "parallel", False):
+        raise _RealtimeProtocolError(
+            "parallel tool calls are not supported",
+            code="unsupported_operation",
+            param="function_call",
+            close_code=_AUTH_CLOSE_CODE,
+        )
+
+    event_call_id = _function_call_id(event)
+    event_name = getattr(event, "function_name", None)
+    if event_name is not None and (
+        not isinstance(event_name, str) or _TOOL_NAME_RE.fullmatch(event_name) is None
+    ):
+        event_name = None
+    state = runtime.function_call
+    if state is not None and (
+        (event_call_id is not None and event_call_id != state.call_id)
+        or (event_name is not None and event_name != state.name)
+    ):
+        raise _RealtimeProtocolError(
+            "parallel tool calls are not supported",
+            code="unsupported_operation",
+            param="function_call",
+            close_code=_AUTH_CLOSE_CODE,
+        )
+    if state is None:
+        state = _FunctionCallState(
+            call_id=event_call_id or f"call_{uuid.uuid4().hex[:16]}",
+            item_id=f"item_{uuid.uuid4().hex[:16]}",
+            response_id=f"resp_{uuid.uuid4().hex[:16]}",
+            name=event_name or _function_name(event, runtime.settings.tools),
+        )
+        runtime.function_call = state
+
+    delta = event.delta or ""
+    full_arguments = getattr(event, "arguments", None)
+    if full_arguments is not None:
+        state.arguments = str(full_arguments)
+    elif event.text is not None:
+        state.arguments = str(event.text)
+    else:
+        state.arguments += delta
+    return {
+        "type": "response.function_call_arguments.delta",
+        "frame_index": event.frame_index,
+        "token_id": event.token_id,
+        "response_id": state.response_id,
+        "item_id": state.item_id,
+        "output_index": 0,
+        "call_id": state.call_id,
+        "name": state.name,
+        "delta": delta,
+        "arguments": state.arguments,
+    }
+
+
+async def _send_function_done(
+    websocket: WebSocket,
+    runtime: _RealtimeRuntime,
+    event: VoiceChatEvent,
+) -> None:
+    state = runtime.function_call
+    if state is None:
+        return
+    await _send_event(
+        websocket,
+        {
+            "type": "response.function_call_arguments.done",
+            "frame_index": event.frame_index,
+            "response_id": state.response_id,
+            "item_id": state.item_id,
+            "output_index": 0,
+            "call_id": state.call_id,
+            "name": state.name,
+            "arguments": state.arguments,
+        },
+    )
+    runtime.function_call = None
+
+
 async def _send_model_events(
     websocket: WebSocket,
     events: Any,
     *,
     output_sample_rate: int,
+    runtime: _RealtimeRuntime | None = None,
 ) -> bool:
     terminal = False
     for event in normalize_voicechat_events(events):
@@ -1009,6 +1322,19 @@ async def _send_model_events(
             )
             terminal = True
             continue
+        if kind == VoiceChatEventKind.FUNCTION.value:
+            if runtime is None:
+                raise _RealtimeProtocolError(
+                    "function events require an active VoiceChat runtime",
+                    code="protocol",
+                )
+            await _send_event(
+                websocket,
+                _function_delta_payload(runtime, event),
+            )
+            continue
+        if kind == VoiceChatEventKind.DONE.value and runtime is not None:
+            await _send_function_done(websocket, runtime, event)
         await _send_event(
             websocket,
             _serialize_model_event(
@@ -1020,17 +1346,17 @@ async def _send_model_events(
             VoiceChatEventKind.DONE.value,
             VoiceChatEventKind.CANCELLED.value,
         }:
+            if kind == VoiceChatEventKind.CANCELLED.value and runtime is not None:
+                runtime.function_call = None
             terminal = True
     return terminal
 
 
-async def _push_samples(
+async def _push_native_samples(
     websocket: WebSocket,
     runtime: _RealtimeRuntime,
-    samples: np.ndarray,
+    native_samples: np.ndarray,
 ) -> bool:
-    runtime.received_audio = runtime.received_audio or samples.size > 0
-    native_samples = runtime.input_resampler.push(samples)
     if native_samples.size == 0:
         return False
     runtime.received_audio = True
@@ -1046,9 +1372,58 @@ async def _push_samples(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
+            runtime=runtime,
         ):
             return True
+        await asyncio.sleep(0)
     return False
+
+
+async def _push_samples(
+    websocket: WebSocket,
+    runtime: _RealtimeRuntime,
+    samples: np.ndarray,
+) -> bool:
+    runtime.received_audio = runtime.received_audio or samples.size > 0
+    for start in range(0, samples.size, _MAX_RESAMPLE_INPUT_SAMPLES):
+        native_samples = runtime.input_resampler.push(
+            samples[start : start + _MAX_RESAMPLE_INPUT_SAMPLES]
+        )
+        if native_samples.size:
+            if runtime.pending_native_samples.size:
+                runtime.pending_native_samples = np.concatenate(
+                    (runtime.pending_native_samples, native_samples)
+                )
+            else:
+                runtime.pending_native_samples = native_samples
+        complete_samples = (
+            runtime.pending_native_samples.size // runtime.frame_samples
+        ) * runtime.frame_samples
+        if complete_samples:
+            complete = runtime.pending_native_samples[:complete_samples]
+            runtime.pending_native_samples = runtime.pending_native_samples[
+                complete_samples:
+            ]
+            if await _push_native_samples(websocket, runtime, complete):
+                return True
+        await asyncio.sleep(0)
+    return False
+
+
+def _take_pending_native_samples(
+    runtime: _RealtimeRuntime,
+    *,
+    pad_partial: bool,
+) -> np.ndarray:
+    pending = runtime.pending_native_samples
+    runtime.pending_native_samples = np.zeros(0, dtype=np.float32)
+    if not pad_partial:
+        runtime.input_resampler.finish()
+        return np.zeros(0, dtype=np.float32)
+    tail = runtime.input_resampler.finish()
+    if pending.size and tail.size:
+        return np.concatenate((pending, tail))
+    return pending if pending.size else tail
 
 
 async def _handle_client_message(
@@ -1058,12 +1433,16 @@ async def _handle_client_message(
     seen_event_ids: set[str],
 ) -> bool:
     if inbound.error:
-        await _send_error(websocket, inbound.error)
+        await _send_error(
+            websocket,
+            inbound.error,
+            code=inbound.error_code,
+            param=inbound.error_param,
+        )
         return False
     if inbound.binary is not None:
         try:
             samples = _decode_binary_pcm16(inbound.binary)
-            return await _push_samples(websocket, runtime, samples)
         except _RealtimeProtocolError as exc:
             await _send_error(
                 websocket,
@@ -1072,6 +1451,7 @@ async def _handle_client_message(
                 param=exc.param,
             )
             return False
+        return await _push_samples(websocket, runtime, samples)
 
     payload = inbound.payload or {}
     client_event_id = None
@@ -1099,6 +1479,7 @@ async def _handle_client_message(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
+            runtime=runtime,
         )
         if not terminal:
             await _send_event(
@@ -1108,14 +1489,17 @@ async def _handle_client_message(
     if message_type == "input_audio_buffer.append":
         try:
             append = _validate_audio_event(payload)
-            sample_rate = append.sample_rate or runtime.settings.input_sample_rate
+            sample_rate = (
+                append.sample_rate
+                if append.sample_rate is not None
+                else runtime.settings.input_sample_rate
+            )
             if sample_rate != runtime.settings.input_sample_rate:
                 raise _RealtimeProtocolError(
                     "audio sample rate does not match the negotiated session rate",
                     param="sample_rate",
                 )
             samples = _decode_pcm16(append.audio)
-            return await _push_samples(websocket, runtime, samples)
         except _RealtimeProtocolError as exc:
             await _send_error(
                 websocket,
@@ -1125,6 +1509,7 @@ async def _handle_client_message(
                 client_event_id=client_event_id,
             )
             return False
+        return await _push_samples(websocket, runtime, samples)
     if message_type == "input_audio_buffer.commit":
         try:
             if "pad_partial" in payload and not isinstance(
@@ -1160,8 +1545,10 @@ async def _handle_client_message(
             )
             return False
         await _send_event(websocket, {"type": "input_audio_buffer.committed"})
-        if commit.pad_partial and await _push_samples(
-            websocket, runtime, runtime.input_resampler.finish()
+        if await _push_native_samples(
+            websocket,
+            runtime,
+            _take_pending_native_samples(runtime, pad_partial=commit.pad_partial),
         ):
             return True
         events = await _maybe_await(
@@ -1171,6 +1558,7 @@ async def _handle_client_message(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
+            runtime=runtime,
         )
         return True
     if message_type == "response.create":
@@ -1202,6 +1590,7 @@ async def _handle_client_message(
                 param=exc.param,
                 client_event_id=client_event_id,
             )
+            return False
         except Exception:
             await _send_error(
                 websocket,
@@ -1210,6 +1599,14 @@ async def _handle_client_message(
                 param="response.create",
                 client_event_id=client_event_id,
             )
+            return False
+        await _send_error(
+            websocket,
+            "response.create is not supported; commit input audio instead",
+            code="unsupported_operation",
+            param="type",
+            client_event_id=client_event_id,
+        )
         return False
     if message_type == "conversation.item.create":
         try:
@@ -1255,13 +1652,18 @@ async def _handle_client_message(
             await _send_error(websocket, "cannot commit an empty input audio buffer")
             return False
         await _send_event(websocket, {"type": "input_audio_buffer.committed"})
-        if await _push_samples(websocket, runtime, runtime.input_resampler.finish()):
+        if await _push_native_samples(
+            websocket,
+            runtime,
+            _take_pending_native_samples(runtime, pad_partial=True),
+        ):
             return True
         events = await _maybe_await(runtime.session.flush(pad_partial=True))
         await _send_model_events(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
+            runtime=runtime,
         )
         return True
 
@@ -1319,6 +1721,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
     startup_task: asyncio.Task[_RealtimeRuntime] | None = None
     processor_task: asyncio.Task[None] | None = None
     seen_event_ids: set[str] = set()
+    control = _RealtimeControl()
     socket_closed = False
 
     async def close_socket(code: int = 1000) -> None:
@@ -1438,7 +1841,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             maxsize=_MAX_QUEUED_MESSAGES
         )
         reader_task = asyncio.create_task(
-            _read_messages(websocket, queue), name="voicechat-realtime-reader"
+            _read_messages(websocket, queue, control), name="voicechat-realtime-reader"
         )
         try:
             pool = _get_engine_pool()
@@ -1510,7 +1913,12 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
 
         processor_task = asyncio.create_task(
             _process_realtime_queue(
-                websocket, runtime, queue, seen_event_ids, close_socket
+                websocket,
+                runtime,
+                queue,
+                seen_event_ids,
+                close_socket,
+                control,
             ),
             name="voicechat-realtime-processor",
         )
@@ -1541,22 +1949,115 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
         await close_socket()
 
 
+async def _cancel_runtime(
+    websocket: WebSocket,
+    runtime: _RealtimeRuntime,
+    control: _RealtimeControl,
+    seen_event_ids: set[str],
+) -> None:
+    payload = control.cancel_payload
+    control.cancel_payload = None
+    control.cancel_event.clear()
+    if payload is not None:
+        try:
+            _validate_event_id(payload, seen_event_ids)
+        except _RealtimeProtocolError as exc:
+            await _send_error(websocket, str(exc), code=exc.code, param=exc.param)
+    events = await _maybe_await(runtime.session.cancel())
+    terminal = await _send_model_events(
+        websocket,
+        events,
+        output_sample_rate=runtime.settings.output_sample_rate,
+        runtime=runtime,
+    )
+    if not terminal:
+        await _send_event(
+            websocket, {"type": "response.cancelled", "frame_index": None}
+        )
+
+
+async def _handle_message_with_cancel(
+    websocket: WebSocket,
+    runtime: _RealtimeRuntime,
+    inbound: _InboundMessage,
+    seen_event_ids: set[str],
+    control: _RealtimeControl,
+) -> bool:
+    operation = asyncio.create_task(
+        _handle_client_message(websocket, runtime, inbound, seen_event_ids),
+        name="voicechat-realtime-message",
+    )
+    cancellation = asyncio.create_task(
+        control.cancel_event.wait(), name="voicechat-realtime-cancel-waiter"
+    )
+    try:
+        done, _ = await asyncio.wait(
+            {operation, cancellation}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if cancellation in done:
+            operation.cancel()
+            with contextlib.suppress(BaseException):
+                await operation
+            await _cancel_runtime(websocket, runtime, control, seen_event_ids)
+            return True
+        return operation.result()
+    finally:
+        if not cancellation.done():
+            cancellation.cancel()
+        with contextlib.suppress(BaseException):
+            await cancellation
+
+
 async def _process_realtime_queue(
     websocket: WebSocket,
     runtime: _RealtimeRuntime,
     queue: asyncio.Queue[_InboundMessage],
     seen_event_ids: set[str],
     close_socket: Callable[[int], Awaitable[None]] | None = None,
+    control: _RealtimeControl | None = None,
 ) -> None:
     while True:
-        inbound = await queue.get()
-        try:
-            should_close = await _handle_client_message(
-                websocket,
-                runtime,
-                inbound,
-                seen_event_ids,
+        if control is None:
+            inbound = await queue.get()
+        else:
+            next_message = asyncio.create_task(
+                queue.get(), name="voicechat-realtime-message-waiter"
             )
+            cancel_waiter = asyncio.create_task(
+                control.cancel_event.wait(), name="voicechat-realtime-cancel-waiter"
+            )
+            done, _ = await asyncio.wait(
+                {next_message, cancel_waiter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancel_waiter in done:
+                next_message.cancel()
+                with contextlib.suppress(BaseException):
+                    await next_message
+                cancel_waiter.cancel()
+                with contextlib.suppress(BaseException):
+                    await cancel_waiter
+                await _cancel_runtime(websocket, runtime, control, seen_event_ids)
+                return
+            cancel_waiter.cancel()
+            with contextlib.suppress(BaseException):
+                await cancel_waiter
+            inbound = next_message.result()
+        try:
+            if control is None:
+                should_close = await _handle_client_message(
+                    websocket,
+                    runtime,
+                    inbound,
+                    seen_event_ids,
+                )
+            else:
+                should_close = await _handle_message_with_cancel(
+                    websocket,
+                    runtime,
+                    inbound,
+                    seen_event_ids,
+                    control,
+                )
         except VoiceChatBusyError:
             await _send_error(
                 websocket,

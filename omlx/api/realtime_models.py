@@ -19,7 +19,7 @@ def _validate_event_id(value: str | None) -> str | None:
 class RealtimeAudioFormat(BaseModel):
     """Structured PCM format used by the OpenAI/NVIDIA session contract."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: str = "pcm16"
     rate: int | None = None
@@ -30,7 +30,7 @@ class RealtimeAudioFormat(BaseModel):
 class RealtimeTool(BaseModel):
     """A function tool definition accepted in a realtime session."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["function"] = "function"
     name: str | None = None
@@ -48,7 +48,7 @@ class RealtimeSessionConfig(BaseModel):
     the loaded engine's native rates.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: str | None = None
     model: str | None = None
@@ -72,7 +72,7 @@ class RealtimeSessionConfig(BaseModel):
 class RealtimeSessionUpdate(BaseModel):
     """The first client event that configures a realtime session."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["session.update"]
     event_id: str | None = None
@@ -84,7 +84,7 @@ class RealtimeSessionUpdate(BaseModel):
 class RealtimeAudioAppend(BaseModel):
     """A base64-encoded PCM16 input chunk."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["input_audio_buffer.append"]
     event_id: str | None = None
@@ -97,7 +97,7 @@ class RealtimeAudioAppend(BaseModel):
 class RealtimeAudioCommit(BaseModel):
     """Commit buffered audio and finish the current model response."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["input_audio_buffer.commit"]
     event_id: str | None = None
@@ -109,7 +109,7 @@ class RealtimeAudioCommit(BaseModel):
 class RealtimeResponseCreate(BaseModel):
     """Optional OpenAI response trigger accepted for client compatibility."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["response.create"]
     event_id: str | None = None
@@ -121,7 +121,7 @@ class RealtimeResponseCreate(BaseModel):
 class RealtimeResponseCancel(BaseModel):
     """Cancel a live VoiceChat response."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["response.cancel", "session.cancel"]
     event_id: str | None = None
@@ -132,7 +132,7 @@ class RealtimeResponseCancel(BaseModel):
 class RealtimeConversationItemCreate(BaseModel):
     """Conversation item event, including rejected tool-result items."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     type: Literal["conversation.item.create"]
     event_id: str | None = None
@@ -144,7 +144,7 @@ class RealtimeConversationItemCreate(BaseModel):
 class RealtimeError(BaseModel):
     """Structured error body used by server error events."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     code: str
     message: str

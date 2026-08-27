@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from ..engine_core import get_mlx_executor
 from .audio_utils import audio_to_wav_bytes
@@ -185,6 +186,16 @@ def _has_audio_samples(samples: Any) -> bool:
         return len(samples) > 0
     except TypeError:
         return True
+
+
+def _audio_frame_chunks(samples: Any, frame_samples: int):
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.ndim == 2 and 1 in audio.shape:
+        audio = audio.reshape(-1)
+    if audio.ndim != 1:
+        raise ValueError("audio must be mono PCM")
+    for start in range(0, audio.shape[0], frame_samples):
+        yield audio[start : start + frame_samples]
 
 
 _MODEL_EVENT_KIND_MAP = {
@@ -484,10 +495,11 @@ class VoiceChatEngine(BaseNonStreamingEngine):
             if self._reservation is reservation and not reservation.released:
                 self._status = VoiceChatStatus.ACTIVE
 
-    def _schedule_cleanup(self, coroutine: Any) -> None:
+    def _schedule_cleanup(self, coroutine: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(coroutine, name="voicechat-cleanup")
         self._cleanup_tasks.add(task)
         task.add_done_callback(self._cleanup_tasks.discard)
+        return task
 
     async def _finish_cancelled_operation(
         self,
@@ -508,7 +520,10 @@ class VoiceChatEngine(BaseNonStreamingEngine):
             await self._release_reservation(reservation)
 
     async def _release_reservation(
-        self, reservation: _Reservation
+        self,
+        reservation: _Reservation,
+        *,
+        cancel_backend: bool = True,
     ) -> list[VoiceChatEvent]:
         async with reservation.close_lock:
             with self._state_lock:
@@ -525,7 +540,11 @@ class VoiceChatEngine(BaseNonStreamingEngine):
             raw_events: Any = []
             raw_session = reservation.raw_session
             cancel = getattr(raw_session, "cancel", None)
-            if callable(cancel) and getattr(raw_session, "closed", False) is not True:
+            if (
+                cancel_backend
+                and callable(cancel)
+                and getattr(raw_session, "closed", False) is not True
+            ):
                 loop = asyncio.get_running_loop()
                 try:
                     raw_events = await loop.run_in_executor(get_mlx_executor(), cancel)
@@ -535,15 +554,23 @@ class VoiceChatEngine(BaseNonStreamingEngine):
                     raw_events = [_error_event(_safe_error_message(exc))]
 
             with self._state_lock:
-                if self._reservation is not reservation:
-                    return normalize_voicechat_events(raw_events)
-                self._reservation = None
-                reservation.released = True
-                self._status = (
-                    VoiceChatStatus.QUEUED
-                    if self._session is not None
-                    else VoiceChatStatus.UNLOADED
-                )
+                is_current = self._reservation is reservation
+                if is_current:
+                    self._reservation = None
+                    reservation.released = True
+                    self._status = (
+                        VoiceChatStatus.QUEUED
+                        if self._session is not None
+                        else VoiceChatStatus.UNLOADED
+                    )
+
+            wrapper = reservation.wrapper
+            reservation.raw_session = None
+            reservation.wrapper = None
+            if wrapper is not None:
+                wrapper._detach_raw_session()
+            if not is_current:
+                return normalize_voicechat_events(raw_events)
 
             with suppress(Exception):
                 await self._finish_activity(reservation.activity_id)
@@ -714,12 +741,15 @@ class VoiceChatRealtimeSession:
         self._engine = engine
         self._reservation = reservation
         self._raw_session = raw_session
-        self._operation_lock = asyncio.Lock()
+        self._push_lock = asyncio.Lock()
         self._operation: asyncio.Future[Any] | None = None
         self._close_task: asyncio.Task[list[VoiceChatEvent]] | None = None
+        self._close_cancel_backend = True
+        self._cancel_event = threading.Event()
         self._closed = False
         self._cancel_requested = False
         self._audio_emitted = False
+        self._session_id = reservation.reservation_id
         self.input_sample_rate = int(
             getattr(raw_session, "input_sample_rate", engine.input_sample_rate)
             or engine.input_sample_rate
@@ -739,35 +769,50 @@ class VoiceChatRealtimeSession:
 
     @property
     def session_id(self) -> str:
-        return self._reservation.reservation_id
+        return self._session_id
+
+    def _detach_raw_session(self) -> None:
+        """Drop model references after the reservation has been released."""
+        self._raw_session = None
+        self._engine = None
+
+    def _ensure_close_task(self, *, cancel_backend: bool = True):
+        if self._close_task is None:
+            engine = self._engine
+            if engine is None:
+                return None
+            self._close_cancel_backend = cancel_backend
+            self._close_task = engine._schedule_cleanup(self._close_impl())
+        elif cancel_backend:
+            self._close_cancel_backend = True
+        return self._close_task
 
     async def _call_model(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
-        if self._closed:
+        engine = self._engine
+        raw_session = self._raw_session
+        if self._closed or engine is None or raw_session is None:
             raise RuntimeError("VoiceChat realtime session is closed")
-        async with self._operation_lock:
-            if self._closed:
-                raise RuntimeError("VoiceChat realtime session is closed")
-            method = getattr(self._raw_session, method_name)
-            loop = asyncio.get_running_loop()
-            operation = loop.run_in_executor(
-                get_mlx_executor(), partial(method, *args, **kwargs)
-            )
-            self._operation = operation
-            self._reservation.operation = operation
-            try:
-                return await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                self._closed = True
-                self._engine._schedule_cleanup(
-                    self._finish_cancelled_operation(operation)
-                )
-                raise
-            finally:
-                if operation.done():
-                    if self._operation is operation:
-                        self._operation = None
-                    if self._reservation.operation is operation:
-                        self._reservation.operation = None
+        method = getattr(raw_session, method_name)
+        loop = asyncio.get_running_loop()
+        operation = loop.run_in_executor(
+            get_mlx_executor(), partial(method, *args, **kwargs)
+        )
+        self._operation = operation
+        self._reservation.operation = operation
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            self._closed = True
+            self._cancel_requested = True
+            self._cancel_event.set()
+            engine._schedule_cleanup(self._finish_cancelled_operation(operation))
+            raise
+        finally:
+            if operation.done():
+                if self._operation is operation:
+                    self._operation = None
+                if self._reservation.operation is operation:
+                    self._reservation.operation = None
 
     async def _finish_cancelled_operation(self, operation: asyncio.Future[Any]) -> None:
         with suppress(BaseException):
@@ -779,34 +824,22 @@ class VoiceChatRealtimeSession:
         with suppress(Exception):
             await self.close()
 
-    async def _events_for_call(
-        self, method_name: str, *args: Any, **kwargs: Any
-    ) -> list[VoiceChatEvent]:
-        try:
-            raw_events = await self._call_model(method_name, *args, **kwargs)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            events = [_error_event(_safe_error_message(exc), code="backend_error")]
-            with suppress(Exception):
-                await self.close()
-            return events
-
-        try:
-            events = normalize_voicechat_events(raw_events)
-        except Exception as exc:
-            events = [_error_event(_safe_error_message(exc), code="protocol")]
-            with suppress(Exception):
-                await self.close()
-            return events
+    def _record_events(self, raw_events: Any) -> list[VoiceChatEvent]:
+        events = normalize_voicechat_events(raw_events)
         self._audio_emitted = self._audio_emitted or any(
             event.kind is VoiceChatEventKind.AUDIO for event in events
         )
-        self._engine._update_activity(
-            self._reservation.activity_id,
-            events_emitted=len(events),
-        )
-        if any(
+        engine = self._engine
+        if engine is not None:
+            engine._update_activity(
+                self._reservation.activity_id,
+                events_emitted=len(events),
+            )
+        return events
+
+    @staticmethod
+    def _is_terminal(events: list[VoiceChatEvent]) -> bool:
+        return any(
             event.kind
             in (
                 VoiceChatEventKind.ERROR,
@@ -814,17 +847,56 @@ class VoiceChatRealtimeSession:
                 VoiceChatEventKind.CANCELLED,
             )
             for event in events
-        ):
-            with suppress(Exception):
-                await self.close()
-        return events
+        )
+
+    async def _push_frame(
+        self, frame: Any, *, sample_rate: int | None
+    ) -> list[VoiceChatEvent]:
+        try:
+            raw_events = await self._call_model(
+                "push_audio", frame, sample_rate=sample_rate
+            )
+            return self._record_events(raw_events)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return [_error_event(_safe_error_message(exc), code="backend_error")]
 
     async def push_audio(
         self, samples: Any, *, sample_rate: int | None = None
     ) -> list[VoiceChatEvent]:
-        return await self._events_for_call(
-            "push_audio", samples, sample_rate=sample_rate
-        )
+        if self._closed:
+            raise RuntimeError("VoiceChat realtime session is closed")
+
+        events: list[VoiceChatEvent] = []
+        terminal = False
+        async with self._push_lock:
+            try:
+                frames = _audio_frame_chunks(samples, self.frame_samples)
+                for frame in frames:
+                    if self._cancel_event.is_set():
+                        break
+                    frame_events = await self._push_frame(
+                        frame, sample_rate=sample_rate
+                    )
+                    events.extend(frame_events)
+                    if self._is_terminal(frame_events):
+                        terminal = True
+                        break
+            except asyncio.CancelledError:
+                self._closed = True
+                self._cancel_requested = True
+                self._cancel_event.set()
+                self._ensure_close_task()
+                raise
+            except Exception as exc:
+                events.append(_error_event(_safe_error_message(exc), code="protocol"))
+                terminal = True
+
+        if terminal:
+            with suppress(Exception):
+                await self.close()
+        return events
 
     async def feed(self, samples: Any, *, sample_rate: int | None = None):
         return await self.push_audio(samples, sample_rate=sample_rate)
@@ -833,7 +905,27 @@ class VoiceChatRealtimeSession:
         return await self.push_audio(samples, sample_rate=sample_rate)
 
     async def flush(self, *, pad_partial: bool = True) -> list[VoiceChatEvent]:
-        events = await self._events_for_call("flush", pad_partial=pad_partial)
+        if self._closed:
+            raise RuntimeError("VoiceChat realtime session is closed")
+
+        try:
+            async with self._push_lock:
+                if self._cancel_event.is_set():
+                    return [VoiceChatEvent(kind=VoiceChatEventKind.CANCELLED)]
+                raw_events = await self._call_model("flush", pad_partial=pad_partial)
+                events = self._record_events(raw_events)
+        except asyncio.CancelledError:
+            self._closed = True
+            self._cancel_requested = True
+            self._cancel_event.set()
+            self._ensure_close_task()
+            raise
+        except Exception as exc:
+            events = [_error_event(_safe_error_message(exc), code="backend_error")]
+            with suppress(Exception):
+                await self.close()
+            return events
+
         if not self._audio_emitted and not any(
             event.kind is VoiceChatEventKind.ERROR for event in events
         ):
@@ -843,37 +935,53 @@ class VoiceChatRealtimeSession:
                     "VoiceChat model produced no audio output", code="no_audio"
                 ),
             )
-        with suppress(Exception):
-            await self.close()
+        self._closed = True
+        self._cancel_event.set()
+        close_task = self._ensure_close_task(cancel_backend=False)
+        if close_task is not None:
+            with suppress(Exception):
+                await asyncio.shield(close_task)
         return events
 
     async def cancel(self) -> list[VoiceChatEvent]:
         self._cancel_requested = True
-        return await self.close()
+        self._closed = True
+        self._cancel_event.set()
+        close_task = self._ensure_close_task()
+        if close_task is not None:
+            return await asyncio.shield(close_task)
+        return [VoiceChatEvent(kind=VoiceChatEventKind.CANCELLED)]
 
     async def close(self) -> list[VoiceChatEvent]:
         self._cancel_requested = True
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(
-                self._close_impl(), name="voicechat-session-close"
-            )
-        return await asyncio.shield(self._close_task)
+        self._closed = True
+        self._cancel_event.set()
+        close_task = self._ensure_close_task()
+        if close_task is None:
+            return [VoiceChatEvent(kind=VoiceChatEventKind.CANCELLED)]
+        return await asyncio.shield(close_task)
 
     async def _close_impl(self) -> list[VoiceChatEvent]:
-        operation = self._operation or self._reservation.operation
-        if operation is not None and not operation.done():
-            with suppress(BaseException):
-                await asyncio.shield(operation)
-        if self._operation is operation:
-            self._operation = None
-        if self._reservation.operation is operation:
-            self._reservation.operation = None
+        async with self._push_lock:
+            operation = self._operation or self._reservation.operation
+            if operation is not None and not operation.done():
+                with suppress(BaseException):
+                    await asyncio.shield(operation)
+            if self._operation is operation:
+                self._operation = None
+            if self._reservation.operation is operation:
+                self._reservation.operation = None
 
-        raw_events = await self._engine._release_reservation(self._reservation)
+            engine = self._engine
+            if engine is None:
+                raw_events: list[VoiceChatEvent] = []
+            else:
+                raw_events = await engine._release_reservation(
+                    self._reservation,
+                    cancel_backend=self._close_cancel_backend,
+                )
         self._closed = True
         events = normalize_voicechat_events(raw_events)
-        if not events and not self._reservation.released:
-            return events
         if not events and self._cancel_requested:
             events = [VoiceChatEvent(kind=VoiceChatEventKind.CANCELLED)]
         return events

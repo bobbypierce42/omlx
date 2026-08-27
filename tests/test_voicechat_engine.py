@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -30,6 +31,9 @@ class FakeStreamingSession:
         self.closed = False
         self.cancel_calls = 0
         self.block_push = False
+        self.push_calls = 0
+        self.push_lengths = []
+        self.push_delay = 0.0
         self.push_started = threading.Event()
         self.push_release = threading.Event()
         self.events = [
@@ -43,9 +47,14 @@ class FakeStreamingSession:
         self.push_error: Exception | None = None
 
     def push_audio(self, samples, *, sample_rate=None):
+        self.push_calls += 1
+        self.push_lengths.append(len(samples))
         del samples, sample_rate
-        if self.block_push:
+        if self.push_calls == 1:
             self.push_started.set()
+        if self.push_delay:
+            time.sleep(self.push_delay)
+        if self.block_push:
             self.push_release.wait(timeout=2)
         if self.push_error is not None:
             raise self.push_error
@@ -187,6 +196,27 @@ async def test_disconnect_cleanup_releases_reservation_and_activity():
 
 
 @pytest.mark.asyncio
+async def test_cancel_returns_before_huge_push_finishes():
+    raw = FakeStreamingSession()
+    raw.push_delay = 0.02
+    engine, _, _ = await _make_engine(raw)
+    session = await engine.create_realtime_session()
+
+    push = asyncio.create_task(session.push_audio([0.0] * (1_280 * 64)))
+    await _wait_for_event(raw.push_started)
+
+    cancelled = await asyncio.wait_for(session.cancel(), timeout=1.0)
+
+    assert [event.kind for event in cancelled] == [VoiceChatEventKind.CANCELLED]
+    assert raw.push_calls < 64
+    assert all(length <= 1_280 for length in raw.push_lengths)
+    assert raw.cancel_calls == 1
+    await push
+    assert engine.has_active_requests() is False
+    await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_cancel_during_model_work_drains_before_release():
     raw = FakeStreamingSession()
     raw.block_push = True
@@ -210,6 +240,23 @@ async def test_cancel_during_model_work_drains_before_release():
     assert raw.cancel_calls == 1
     assert session.closed is True
     await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_close_detaches_raw_session_references():
+    engine, _, raw = await _make_engine()
+    session = await engine.create_realtime_session()
+    reservation = session._reservation
+
+    await session.close()
+
+    assert raw.closed is True
+    assert session._raw_session is None
+    assert session._engine is None
+    assert reservation.raw_session is None
+    assert reservation.wrapper is None
+    await engine.stop()
+    assert engine._model is None
 
 
 @pytest.mark.asyncio

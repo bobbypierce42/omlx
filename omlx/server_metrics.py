@@ -457,7 +457,7 @@ class ServerMetrics:
         *,
         model_id: str = "",
         outcome: str = "failed",
-        audio_duration_seconds: float = 0.0,
+        audio_duration_seconds: Optional[float] = None,
     ) -> None:
         """Record one VoiceChat offline STS request without retaining audio."""
         outcome = str(outcome).strip().lower().replace("-", "_").replace(" ", "_")
@@ -477,13 +477,13 @@ class ServerMetrics:
         }
         if outcome == "busy":
             updates["busy_responses"] = 1
-        try:
-            duration = float(audio_duration_seconds)
-        except (TypeError, ValueError, OverflowError):
-            duration = 0.0
-        updates["audio_duration_seconds"] = (
-            duration if math.isfinite(duration) and duration >= 0 else 0.0
-        )
+        if audio_duration_seconds is not None:
+            try:
+                duration = float(audio_duration_seconds)
+            except (TypeError, ValueError, OverflowError):
+                duration = None
+            if duration is not None and math.isfinite(duration) and duration >= 0:
+                updates["audio_duration_seconds"] = duration
         self._record_voicechat_update(model_id, updates)
 
     def record_voicechat_tool(self, outcome: str, *, model_id: str = "") -> None:

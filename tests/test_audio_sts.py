@@ -297,6 +297,21 @@ class TestVoiceChatEndpoint:
         assert metric_kwargs["outcome"] == "failed"
         assert metric_kwargs["audio_duration_seconds"] == pytest.approx(0.1)
 
+    def test_non_wav_duration_is_unmeasured_not_zero(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        metrics = MagicMock()
+        with patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics):
+            response = client.post(
+                "/v1/audio/process",
+                files={"file": ("recorded.mp3", b"encoded-audio", "audio/mpeg")},
+                data={"model": "voicechat"},
+            )
+
+        assert response.status_code == 200
+        assert voicechat.process.await_count == 1
+        metric_kwargs = metrics.record_voicechat_offline_request.call_args.kwargs
+        assert metric_kwargs["audio_duration_seconds"] is None
+
     def test_empty_audio_is_rejected_before_inference(self, voicechat_client):
         client, _, voicechat = voicechat_client
         response = client.post(
@@ -409,6 +424,12 @@ class TestVoiceChatEndpoint:
         assert (
             metrics.record_voicechat_offline_request.call_args.kwargs["outcome"]
             == "cancelled"
+        )
+        assert (
+            metrics.record_voicechat_offline_request.call_args.kwargs[
+                "audio_duration_seconds"
+            ]
+            == pytest.approx(0.1)
         )
 
     def test_invalid_engine_output_returns_server_error(self, voicechat_client):

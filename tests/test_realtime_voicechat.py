@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from omlx.api.realtime_routes import _serialize_model_event, realtime_router
 from omlx.engine.voicechat import VoiceChatBusyError, VoiceChatEngine, VoiceChatEvent
+from omlx.server_metrics import ServerMetrics
 
 
 class _StubStreamingSession:
@@ -587,6 +588,106 @@ def test_busy_session_closes_with_retryable_code():
             first.send_json({"type": "response.cancel"})
             assert first.receive_json()["type"] == "response.cancelled"
             first.__exit__(None, None, None)
+
+
+def test_route_disconnect_increments_server_metrics():
+    metrics = ServerMetrics()
+    patches, client, _ = _client(_StubStreamingSession())
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch("omlx.server_metrics.get_server_metrics", return_value=metrics),
+        client,
+    ):
+        websocket, _, _ = _connect_and_configure(client)
+        websocket.__exit__(None, None, None)
+
+    snapshot = metrics.get_voicechat_snapshot()
+    assert snapshot["session_terminal_states"] == {
+        "done": 0,
+        "cancelled": 0,
+        "disconnected": 1,
+        "busy": 0,
+        "error": 0,
+    }
+
+
+def test_route_cancel_increments_server_metrics():
+    metrics = ServerMetrics()
+    patches, client, _ = _client(_StubStreamingSession())
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch("omlx.server_metrics.get_server_metrics", return_value=metrics),
+        client,
+    ):
+        websocket, _, _ = _connect_and_configure(client)
+        websocket.send_json({"type": "response.cancel"})
+        assert websocket.receive_json()["type"] == "response.cancelled"
+        websocket.__exit__(None, None, None)
+
+    snapshot = metrics.get_voicechat_snapshot()
+    assert snapshot["session_terminal_states"]["cancelled"] == 1
+    assert snapshot["cancellations"] == 1
+
+
+def test_route_busy_increments_server_metrics():
+    metrics = ServerMetrics()
+    patches, client, engine = _client(_StubStreamingSession())
+    engine.create_realtime_session.side_effect = VoiceChatBusyError()
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch("omlx.server_metrics.get_server_metrics", return_value=metrics),
+        client,
+    ):
+        websocket = client.websocket_connect("/v1/realtime")
+        websocket.__enter__()
+        try:
+            assert websocket.receive_json()["type"] == "session.created"
+            websocket.send_json(
+                {"type": "session.update", "session": {"model": "fake-voicechat"}}
+            )
+            assert websocket.receive_json()["error"]["code"] == "server_busy"
+        finally:
+            websocket.__exit__(None, None, None)
+
+    snapshot = metrics.get_voicechat_snapshot()
+    assert snapshot["session_terminal_states"]["busy"] == 1
+    assert snapshot["busy_responses"] == 1
+
+
+def test_route_error_increments_server_metrics():
+    metrics = ServerMetrics()
+    session = _StubStreamingSession(
+        [VoiceChatEvent(kind="error", error="backend failure")]
+    )
+    patches, client, _ = _client(session)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patch("omlx.server_metrics.get_server_metrics", return_value=metrics),
+        client,
+    ):
+        websocket, _, _ = _connect_and_configure(client)
+        try:
+            pcm = np.zeros(1_280, dtype="<i2").tobytes()
+            websocket.send_json(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode("ascii"),
+                }
+            )
+            assert websocket.receive_json()["type"] == "error"
+        finally:
+            websocket.__exit__(None, None, None)
+
+    snapshot = metrics.get_voicechat_snapshot()
+    assert snapshot["session_terminal_states"]["error"] == 1
 
 
 def test_disconnect_during_session_startup_cancels_startup_task():

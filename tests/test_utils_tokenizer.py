@@ -632,8 +632,8 @@ class TestMistralCommonTokenizerConfig:
     Small Tekken exports) to MistralCommonBackend, whose rendered chat
     template cannot be re-encoded faithfully — control tokens become literal
     text and every prompt built via render-then-encode is corrupted. Passing
-    fix_mistral_regex selects TokenizersBackend instead (gate shipped in
-    transformers 5.12.1, the pyproject floor).
+    fix_mistral_regex selects TokenizersBackend instead (the gate shipped in
+    transformers 5.12.1 and remains available at the 5.14.0 project floor).
     """
 
     def _make_mistral_repo(self, tmp_path):

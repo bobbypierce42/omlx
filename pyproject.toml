@@ -44,7 +44,7 @@ dependencies = [
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
     "mlx==0.32.0",
-    # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.13+
+    # mlx-lm from commit (ab1806e, v0.31.3) - transformers 5.14+
     # NewlineTokenizer registration compatibility, DeepSeek/GLM DSA indexer
     # RoPE fix, trust_remote_code load gate, transformers 5.7.0
     # compatibility, and prior BatchGenerator/cache fixes.
@@ -54,13 +54,12 @@ dependencies = [
     # mlx-embeddings from latest commit (32981fa)
     "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
-    # Keep <5.13 until the broader dependency set gets a dedicated resolver
-    # smoke test with transformers 5.13+. The mlx-lm pin above includes the
-    # known NewlineTokenizer registration fix. Floor 5.12.1: AutoTokenizer's
-    # fix_mistral_regex backend gate (used by get_tokenizer_config for
-    # mistral-common models) first shipped in 5.12.1 — on older 5.x the kwarg
-    # is silently swallowed and Tekken prompts stay corrupted.
-    "transformers>=5.12.1,<5.13",
+    # The VoiceChat baseline's mlx-vlm and mlx-audio pins require transformers
+    # 5.14+. The mlx-lm pin above includes the known NewlineTokenizer
+    # registration fix. AutoTokenizer's fix_mistral_regex backend gate (used by
+    # get_tokenizer_config for mistral-common models) first shipped in 5.12.1,
+    # so it remains available at this floor.
+    "transformers>=5.14.0",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
@@ -117,9 +116,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 78b96eb. MiniMax M3 support is vendored under
-    # omlx.patches.mlx_vlm_minimax_m3_compat because upstream removed it.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@78b96eb5462141447b9a6b4943ef553891da56dd",
+    # mlx-vlm from merged VoiceChat PR #1817. Existing model-specific
+    # compatibility packages remain vendored under omlx.patches.
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@e2bb5d68422ba28e51e530dc1c63b067dd2d1cb3",
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.10+omlx.7 (c55324c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
     # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
@@ -152,11 +151,10 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
-    # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
-    # stt extra: tiktoken, mistral-common[audio]
-    # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    # mlx-audio from merged PRs #876 and #878 with tts/stt/sts extras.
+    # tts/stt extras provide sentencepiece and mistral-common audio support;
+    # sts also provides webrtcvad and its setuptools compatibility pin.
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@8c4fb74b3393475f3080a46b204c511781a547d4",
     # WebSocket protocol impl for uvicorn (realtime STT endpoint). Pure
     # python; uvicorn's ws="auto" picks it up when installed.
     "wsproto==1.2.0",
@@ -174,12 +172,12 @@ paroquant = [
 # version-free. End-users don't `pip install omlx[bundle]`; this is for
 # the macOS .app build pipeline.
 #
-# mlx-audio[tts,stt,sts]'s 12 transitive deps appear explicitly because
+# mlx-audio[tts,stt,sts]'s bundle dependencies appear explicitly because
 # venvstacks 0.7.0's internal `uv pip compile` runs with --no-config and
 # doesn't propagate pyproject.toml's `tool.uv.override-dependencies`,
-# so it can't resolve mlx-audio's `mlx-lm==0.31.1` pin against our
-# git-pinned mlx-lm (v0.31.3). build.py installs mlx-audio + paroquant
-# separately via --no-deps post-resolution.
+# so the bundle keeps its runtime dependency set independent of the package
+# metadata. build.py installs mlx-audio + paroquant separately via --no-deps
+# post-resolution.
 bundle = [
     "mcp>=2.0.0,<3",
     "modelscope>=1.10.0",
@@ -215,7 +213,7 @@ dev = [
     # in the dev environment so the test actually runs.
     #
     # Held at 0.2.3: xgrammar 0.2.4/0.2.5 cap transformers at <5,
-    # which conflicts with our transformers>=5.12.1 pin and makes
+    # which conflicts with our transformers>=5.14.0 pin and makes
     # pip/uv dev installs unresolvable (#2289). Bump again once
     # upstream lifts the cap.
     "xgrammar==0.2.3",
@@ -266,8 +264,8 @@ include = ["omlx*"]
 "omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
 
 [tool.uv]
-# mlx and mlx-lm are git-pinned; override transitive pins
-# (e.g. mlx-audio -> mlx-lm==0.31.1) so the resolver accepts them.
+# mlx and mlx-lm are git-pinned; keep transitive requirements aligned with
+# those exact builds.
 override-dependencies = [
     "mlx==0.32.0",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ab1806e8f5d6aa035973af194a1b9198ab4754dc",

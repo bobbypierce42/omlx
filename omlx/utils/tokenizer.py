@@ -605,8 +605,9 @@ def get_tokenizer_config(
         # honoring the backend the repo itself declares — and enables the
         # Tekken pre-tokenizer regex fix where transformers' own config
         # detection applies. AutoTokenizer's routing
-        # gate for this kwarg shipped in transformers 5.12.1 (the pyproject
-        # floor); older 5.x swallows it and keeps the broken backend.
+        # gate for this kwarg shipped in transformers 5.12.1, below the
+        # project's 5.14.0 floor; older 5.x swallows it and keeps the broken
+        # backend.
         config.setdefault("fix_mistral_regex", True)
         logger.debug(
             "mistral-common model detected: forcing HF-native tokenizer "

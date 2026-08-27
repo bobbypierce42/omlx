@@ -204,7 +204,7 @@ def test_load_model_forces_sanitize_only_for_raw_inkling(
 
     arch = SimpleNamespace(ModelConfig=FakeModelConfig, Model=FakeModel)
     monkeypatch.setattr(
-        vlm_utils, "get_model_and_args", lambda config: (arch, "inkling")
+        vlm_utils, "get_model_and_args", lambda config, **_: (arch, "inkling")
     )
     monkeypatch.setattr(
         vlm_utils,

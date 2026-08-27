@@ -62,18 +62,18 @@ def _install_vendor_namespace() -> None:
     import mlx_vlm.models
     import mlx_vlm.tool_parsers
 
-    _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-    _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-    _append_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
+    _prepend_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+    _prepend_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+    _prepend_package_path(mlx_vlm.tool_parsers, _VENDOR_MLX_VLM / "tool_parsers")
 
 
-def _append_package_path(package: Any, path: Path) -> None:
+def _prepend_package_path(package: Any, path: Path) -> None:
     package_path = getattr(package, "__path__", None)
     if package_path is None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:

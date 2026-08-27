@@ -22,15 +22,15 @@ per-depth stateful caches, uniform-window chained passes, double-normed
 embedding input), measured 0.87/0.76/0.67/0.61 with the same weights.
 
 `processing_inkling.py` is NOT from mlx-vlm: it is a torch-free numpy/PIL
-port of transformers 5.14's Inkling processors (Apache-2.0), needed
-because oMLX pins transformers <5.13. Audio (dMel) extraction is not
-implemented yet (text+vision first).
+port of transformers 5.14's Inkling processors (Apache-2.0), kept to avoid
+the reference processor's torch dependency and preserve the oMLX contract.
+Audio (dMel) extraction is not implemented yet (text+vision first).
 
 The sibling shims `../mlp.py`, `../switch_layers.py`, `../activations.py`
 are byte-identical copies from the same PR head; they do not exist at the
-oMLX mlx-vlm pin (`78b96eb`). The `__path__`-append install searches the
-real package first, so a future pin bump that ships any of these upstream
-automatically retires the vendored copy.
+oMLX mlx-vlm pin (`78b96eb`). The `__path__`-prepend install keeps these
+tested shims ahead of same-named upstream modules while the compatibility
+contract remains active.
 
-Retire this whole package when the mlx-vlm pin advances past PR #1756's
-merge (and transformers reaches 5.14+ for the processors).
+Keep this package until the oMLX compatibility tests no longer require its
+model and processor contracts.

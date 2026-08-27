@@ -1,8 +1,7 @@
 # Torch-free port of transformers' Inkling processors (transformers
 # 5.14+, src/transformers/models/inkling/{image_processing,processing}_
-# inkling.py, Apache-2.0). oMLX pins transformers <5.13, so the classes
-# are vendored here on numpy/PIL following the mlx-vlm custom-processor
-# pattern (see unlimited_ocr's processing_unlimitedocr.py).
+# inkling.py, Apache-2.0). oMLX keeps a torch-free numpy/PIL copy to preserve
+# the tested processor contract without importing the reference implementation.
 #
 # Differences from the transformers reference, on purpose:
 # - PIL resampling instead of torchvision (bit-parity with torchvision

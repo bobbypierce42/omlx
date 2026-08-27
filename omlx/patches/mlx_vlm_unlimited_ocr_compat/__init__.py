@@ -8,7 +8,8 @@ commits, KEEP-patch re-verification), this vendors the model package and
 wires up only the discovery surface oMLX needs:
 
 - installs the vendored `mlx_vlm.models.unlimited_ocr` package onto the real
-  `mlx_vlm.models` namespace so `get_model_and_args` can import it (its own
+  `mlx_vlm.models` namespace with the vendor path first so `get_model_and_args`
+  can import the tested contract (its own
   relative imports `..deepseekocr`/`..base`/`..cache` resolve against the real
   mlx-vlm package, which already ships `deepseekocr` at the pin),
 - adds the `unlimited-ocr -> unlimited_ocr` entry to `mlx_vlm.utils`'
@@ -72,17 +73,17 @@ def _install_vendor_namespace() -> None:
     import mlx_vlm
     import mlx_vlm.models
 
-    _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-    _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+    _prepend_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+    _prepend_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
 
 
-def _append_package_path(package: Any, path: Path) -> None:
+def _prepend_package_path(package: Any, path: Path) -> None:
     package_path = getattr(package, "__path__", None)
     if package_path is None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:

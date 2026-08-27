@@ -10,10 +10,9 @@ SwitchGLU from mlx-lm, whose activation contract differs), and wires the
 discovery surface oMLX needs:
 
 - installs the vendored packages onto the real `mlx_vlm.models` namespace
-  (`__path__` append) so `get_model_and_args` can import them; relative
-  imports (`..base`, `..cache`) resolve against the real pinned mlx-vlm.
-  If a future pin bump ships these modules upstream, the real ones win
-  automatically (the vendor path is searched last).
+  (`__path__` prepend) so `get_model_and_args` keeps using the tested vendor
+  contracts when a newer pin ships same-named modules; relative imports
+  (`..base`, `..cache`) still resolve against the pinned mlx-vlm.
 - adds `inkling_mm_model -> inkling` to `mlx_vlm.utils.MODEL_REMAPPING`
   (checkpoints declare `model_type: "inkling_mm_model"`).
 - registers `inkling`/`inkling_mm_model` in `prompt_utils.MODEL_CONFIG`
@@ -22,8 +21,8 @@ discovery surface oMLX needs:
   emitted yet: oMLX serves inkling text+vision first, and the vendored
   processor rejects audio arrays with a clear error.
 - registers the vendored torch-free `InklingProcessor` with
-  `AutoProcessor` (the reference processors only exist in transformers
-  5.14+, above oMLX's <5.13 pin).
+  `AutoProcessor`; the local processor avoids a torch dependency and preserves
+  the oMLX processor contract on the newer Transformers floor.
 - wraps `mlx_vlm.utils.load_config` to translate a ModelOpt
   `hf_quant_config.json` (quant_algo NVFP4) into MLX quantization config
   `{group_size: 16, bits: 4, mode: "nvfp4"}`, porting PR #1756's
@@ -55,6 +54,9 @@ _MODULE_NAME = "inkling"
 _APPLIED = False
 _FORCE_SANITIZE_DIR: ContextVar[Path | None] = ContextVar(
     "omlx_inkling_force_sanitize_dir", default=None
+)
+_SKIP_NATIVE_SANITIZE: ContextVar[bool] = ContextVar(
+    "omlx_inkling_skip_native_sanitize", default=False
 )
 _RAW_WEIGHT_PREFIXES = ("model.llm.", "model.visual.", "model.audio.", "model.mtp.")
 
@@ -94,17 +96,17 @@ def _install_vendor_namespace() -> None:
     import mlx_vlm
     import mlx_vlm.models
 
-    _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-    _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+    _prepend_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+    _prepend_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
 
 
-def _append_package_path(package: Any, path: Path) -> None:
+def _prepend_package_path(package: Any, path: Path) -> None:
     package_path = getattr(package, "__path__", None)
     if package_path is None:
         return
     path_str = str(path)
     if path_str not in package_path:
-        package_path.append(path_str)
+        package_path.insert(0, path_str)
 
 
 def _import_vendor_modules() -> None:
@@ -278,13 +280,14 @@ def _has_raw_inkling_weights(model_path: Any) -> bool:
 
 
 def _patch_force_sanitize(vlm_utils: Any) -> None:
-    """Run the pinned mlx-vlm sanitizer for raw MLX-format Inkling weights.
+    """Run the mlx-vlm sanitizer only for raw Inkling weight layouts.
 
-    The pinned loader trusts ``format=mlx`` and skips ``Model.sanitize``. Community
-    Inkling conversions retain the source ``model.llm.*`` naming despite that
-    marker, so their keys and quantization sidecars must still be remapped before
-    ``nn.quantize`` inspects the weight dictionary. The context-local directory
-    keeps the metadata override scoped to this checkpoint and safe across threads.
+    Community Inkling conversions retain the source ``model.llm.*`` naming despite
+    the ``format=mlx`` marker, so their keys and quantization sidecars must still
+    be remapped before ``nn.quantize`` inspects the weight dictionary. Newer
+    mlx-vlm versions sanitize native MLX layouts unconditionally, so the
+    context-local flag restores the native no-sanitize behavior without changing
+    other model loads.
     """
     import safetensors
 
@@ -295,6 +298,18 @@ def _patch_force_sanitize(vlm_utils: Any) -> None:
         return
 
     original_safe_open = safetensors.safe_open
+    original_sanitize_weights = getattr(vlm_utils, "sanitize_weights", None)
+    if original_sanitize_weights is None:
+        return
+
+    def patched_sanitize_weights(model_obj, weights, config=None):
+        if _SKIP_NATIVE_SANITIZE.get():
+            return weights
+        return original_sanitize_weights(model_obj, weights, config)
+
+    patched_sanitize_weights._omlx_inkling_force_sanitize = True
+    patched_sanitize_weights._omlx_original = original_sanitize_weights
+    vlm_utils.sanitize_weights = patched_sanitize_weights
 
     class _SafeOpenMetadataWrapper:
         def __init__(self, inner):
@@ -330,16 +345,37 @@ def _patch_force_sanitize(vlm_utils: Any) -> None:
             return _SafeOpenMetadataWrapper(handle)
         return handle
 
-    def patched_load_model(model_path, lazy=False, **kwargs):
-        if not _has_raw_inkling_weights(model_path):
-            return original_load_model(model_path, lazy=lazy, **kwargs)
-        target_dir = Path(model_path).resolve()
-        token = _FORCE_SANITIZE_DIR.set(target_dir)
+    def _is_native_mlx_checkpoint(model_path):
+        path = Path(model_path)
+        weight_files = sorted(path.glob("*.safetensors"))
+        if not weight_files:
+            return False
         try:
-            logger.info("Forcing sanitize for raw Inkling weights in %s", target_dir)
+            with original_safe_open(str(weight_files[0]), framework="np") as handle:
+                metadata = handle.metadata()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Inkling format detection failed for %s: %s", path, exc)
+            return False
+        return isinstance(metadata, dict) and metadata.get("format") == "mlx"
+
+    def patched_load_model(model_path, lazy=False, **kwargs):
+        raw_layout = _has_raw_inkling_weights(model_path)
+        native_layout = not raw_layout and _is_native_mlx_checkpoint(model_path)
+        skip_token = _SKIP_NATIVE_SANITIZE.set(native_layout)
+        force_token = None
+        if raw_layout:
+            target_dir = Path(model_path).resolve()
+            force_token = _FORCE_SANITIZE_DIR.set(target_dir)
+        try:
+            if raw_layout:
+                logger.info(
+                    "Forcing sanitize for raw Inkling weights in %s", target_dir
+                )
             return original_load_model(model_path, lazy=lazy, **kwargs)
         finally:
-            _FORCE_SANITIZE_DIR.reset(token)
+            _SKIP_NATIVE_SANITIZE.reset(skip_token)
+            if force_token is not None:
+                _FORCE_SANITIZE_DIR.reset(force_token)
 
     patched_safe_open._omlx_inkling_force_sanitize = True
     patched_safe_open._omlx_original = original_safe_open

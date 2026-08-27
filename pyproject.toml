@@ -184,16 +184,19 @@ bundle = [
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
     "librosa>=0.10.0",
-    "miniaudio>=1.59",
+    "miniaudio>=1.61",
     "numba>=0.59.0",
     "pyloudnorm>=0.1.0",
-    "sounddevice>=0.4.6",
+    "sounddevice>=0.5.3",
     "misaki>=0.9.4",
     "num2words>=0.5.14",
     "spacy>=3.8.4",
     "phonemizer-fork>=3.3.2",
     "espeakng-loader>=0.2.4",
     "webrtcvad>=2.0.10",
+    # mlx-audio's STS extra requires setuptools<81 because newer releases
+    # remove pkg_resources, which webrtcvad imports.
+    "setuptools<81",
     # [audio] extra on top of pyproject's plain mistral-common>=1.10
     "mistral-common[audio]>=1.10",
     # realtime STT WebSocket endpoint

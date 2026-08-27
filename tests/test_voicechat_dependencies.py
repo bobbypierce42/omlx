@@ -23,6 +23,7 @@ def test_voicechat_dependency_pins_are_aligned():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
     project_dependencies = pyproject["project"]["dependencies"]
     audio_dependencies = pyproject["project"]["optional-dependencies"]["audio"]
+    bundle_dependencies = pyproject["project"]["optional-dependencies"]["bundle"]
     vlm_requirement = next(
         requirement
         for requirement in project_dependencies
@@ -49,6 +50,9 @@ def test_voicechat_dependency_pins_are_aligned():
     assert _revision(vlm_requirement) == MLX_VLM_REVISION
     assert _revision(audio_requirement) == MLX_AUDIO_REVISION
     assert transformers_requirement == "transformers>=5.14.0"
+    assert "miniaudio>=1.61" in bundle_dependencies
+    assert "sounddevice>=0.5.3" in bundle_dependencies
+    assert "setuptools<81" in bundle_dependencies
     assert build_match.group(1) == MLX_AUDIO_REVISION
     assert formula_match.group(1) == MLX_AUDIO_REVISION
 

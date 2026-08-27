@@ -100,7 +100,8 @@ def test_voicechat_negotiates_audio_and_cleans_up_microphone():
 
 
 def test_voicechat_flushes_audio_worklet_tail_before_transport_stop():
-    voicechat = _voicechat_section(_template())
+    source = _template()
+    voicechat = _voicechat_section(source)
 
     assert "this._emit()" in voicechat
     assert "{ type: 'flush' }" in voicechat
@@ -108,6 +109,10 @@ def test_voicechat_flushes_audio_worklet_tail_before_transport_stop():
     assert "flushVoiceChatCapture(session)" in voicechat
     assert "session.flushingCapture" in voicechat
     assert "await this.flushVoiceChatCapture(session)" in voicechat
+    assert "VOICECHAT_CAPTURE_FLUSH_TIMEOUT_MS" in source
+    assert "setTimeout(" in voicechat
+    assert "worklet.onprocessorerror" in voicechat
+    assert "_resolveVoiceChatCaptureFlush(session)" in voicechat
 
 
 def test_voicechat_renders_transcript_text_playback_and_interruption():

@@ -39,6 +39,7 @@ from .realtime_models import (
     RealtimeResponseCreate,
     RealtimeSessionUpdate,
 )
+from .safe_messages import safe_message as _safe_message
 
 realtime_router = APIRouter()
 
@@ -60,12 +61,6 @@ _SUPPORTED_SAMPLE_RATES = frozenset(
 )
 _SUPPORTED_PCM_FORMATS = frozenset({"pcm16", "audio/pcm", "audio/x-pcm", "s16le"})
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_BEARER_SECRET_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-_NAMED_SECRET_RE = re.compile(
-    r"(?i)\b(api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|password|secret|credential|token|key)"
-    r"\s*[:=]\s*(?:bearer\s+)?[^\s,;}\]]+"
-)
-_TOKEN_SECRET_RE = re.compile(r"(?i)\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}\b")
 
 
 class _RealtimeProtocolError(ValueError):
@@ -264,16 +259,6 @@ def _terminal_state_from_events(events: Any) -> str | None:
 def _set_runtime_terminal(runtime: _RealtimeRuntime, state: str) -> None:
     if runtime.terminal_state is None:
         runtime.terminal_state = state
-
-
-def _safe_message(value: Any, fallback: str = "realtime request failed") -> str:
-    message = str(value).replace("\r", " ").replace("\n", " ").strip()
-    message = _BEARER_SECRET_RE.sub("Bearer <redacted>", message)
-    message = _NAMED_SECRET_RE.sub(
-        lambda match: f"{match.group(1)}=<redacted>", message
-    )
-    message = _TOKEN_SECRET_RE.sub("<redacted>", message)
-    return (message[:500] or fallback)[:500]
 
 
 async def _maybe_await(value: Any) -> Any:

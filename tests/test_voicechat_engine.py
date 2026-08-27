@@ -17,6 +17,7 @@ from omlx.engine.voicechat import (
     VoiceChatEventKind,
     VoiceChatInferenceError,
     VoiceChatStatus,
+    _safe_error_message,
     normalize_voicechat_events,
 )
 from omlx.engine_pool import EngineEntry, EnginePool
@@ -157,6 +158,16 @@ async def test_load_failure_is_strict_and_status_is_failed():
     assert engine.status is VoiceChatStatus.FAILED
     assert engine.get_status()["loaded"] is False
     assert engine.get_status()["error"]
+
+
+def test_safe_error_message_redacts_json_api_key():
+    secret = "json-shaped-api-key"
+    message = _safe_error_message(
+        RuntimeError(f'backend failed: {{"api_key": "{secret}"}}')
+    )
+
+    assert secret not in message
+    assert '"api_key": "<redacted>"' in message
 
 
 @pytest.mark.asyncio

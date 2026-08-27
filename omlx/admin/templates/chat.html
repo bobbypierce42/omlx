@@ -2850,6 +2850,7 @@
 
             // MODEL SETTINGS Section State (shared prompt profiles from PROFILE tab)
             TOOL_TIMEOUT_MS: 30000,      // Per-tool execution timeout (ms)
+            VOICECHAT_CAPTURE_FLUSH_TIMEOUT_MS: 1000,
 
             // MCP tools & prefill polling
             mcpTools: [],                // OpenAI-format tool definitions loaded from /v1/mcp/tools
@@ -6147,6 +6148,7 @@
             turnCommitted: false,
             flushResolve: null,
             flushPromise: null,
+            flushTimer: null,
             flushingCapture: false,
             usingAudioWorklet: false,
             _beforeUnload: () => this.stopVoiceChat({ discard: true }),
@@ -6596,14 +6598,13 @@
             worklet.port.onmessage = (event) => {
                 const message = event.data;
                 if (message?.type === 'flushed') {
-                    const resolve = session.flushResolve;
-                    session.flushResolve = null;
-                    session.flushingCapture = false;
-                    session.flushPromise = null;
-                    if (resolve) resolve();
+                    this._resolveVoiceChatCaptureFlush(session);
                     return;
                 }
                 handleChunk(message?.type === 'audio' ? message.samples : message);
+            };
+            worklet.onprocessorerror = () => {
+                this._resolveVoiceChatCaptureFlush(session);
             };
             source.connect(worklet);
             if (sink) worklet.connect(sink);
@@ -6624,19 +6625,31 @@
         if (session.flushPromise) return session.flushPromise;
         session.flushingCapture = true;
         session.flushPromise = new Promise(resolve => {
-            session.flushResolve = () => {
-                session.flushResolve = null;
-                session.flushingCapture = false;
-                session.flushPromise = null;
-                resolve();
-            };
+            session.flushResolve = resolve;
+            session.flushTimer = setTimeout(
+                () => this._resolveVoiceChatCaptureFlush(session),
+                this.VOICECHAT_CAPTURE_FLUSH_TIMEOUT_MS,
+            );
             try {
                 session.workletNode.port.postMessage({ type: 'flush' });
             } catch (e) {
-                session.flushResolve();
+                this._resolveVoiceChatCaptureFlush(session);
             }
         });
         return session.flushPromise;
+    },
+
+    _resolveVoiceChatCaptureFlush(session) {
+        const resolve = session?.flushResolve;
+        if (!resolve) return;
+        session.flushResolve = null;
+        if (session.flushTimer !== null) {
+            clearTimeout(session.flushTimer);
+            session.flushTimer = null;
+        }
+        session.flushingCapture = false;
+        session.flushPromise = null;
+        resolve();
     },
 
     _stopVoiceChatCapture(session) {
@@ -6645,9 +6658,7 @@
             && !session.stopping && !session.finalized) {
             try { session.workletNode.port.postMessage({ type: 'flush' }); } catch (e) { }
         }
-        if (session.flushResolve) {
-            session.flushResolve();
-        }
+        this._resolveVoiceChatCaptureFlush(session);
         if (session.workletNode) {
             try { session.workletNode.disconnect(); } catch (e) { }
             session.workletNode = null;

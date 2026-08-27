@@ -20,6 +20,7 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from ..api.safe_messages import safe_message
 from ..engine_core import get_mlx_executor
 from .audio_utils import audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -157,8 +158,7 @@ class VoiceChatInferenceError(VoiceChatError):
 
 
 def _safe_error_message(exc: BaseException) -> str:
-    message = str(exc).replace("\r", " ").replace("\n", " ").strip()
-    return message[:500] or type(exc).__name__
+    return safe_message(exc, fallback=type(exc).__name__)
 
 
 def _error_event(

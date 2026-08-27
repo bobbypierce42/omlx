@@ -5136,6 +5136,12 @@ async def get_server_stats(
     metrics = get_server_metrics()
     resolved_model = resolve_model_id(model) or model if model else ""
     snapshot = metrics.get_snapshot(model_id=resolved_model, scope=scope)
+    voicechat_snapshot = {}
+    get_voicechat_snapshot = getattr(metrics, "get_voicechat_snapshot", None)
+    if callable(get_voicechat_snapshot):
+        candidate = get_voicechat_snapshot(model_id=resolved_model, scope=scope)
+        if isinstance(candidate, dict):
+            voicechat_snapshot = candidate
 
     global_settings = _get_global_settings()
     host = global_settings.server.host if global_settings else "127.0.0.1"
@@ -5160,6 +5166,7 @@ async def get_server_stats(
         "engines": _get_engine_info(),
         "active_models": active_models_data,
         "runtime_cache": runtime_cache_data,
+        "voicechat_metrics": voicechat_snapshot,
     }
 
 

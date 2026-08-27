@@ -95,6 +95,65 @@
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
+    function emptyVoiceChatMetrics() {
+        return {
+            sessions_started: 0,
+            sessions_completed: 0,
+            sessions_cancelled: 0,
+            sessions_disconnected: 0,
+            sessions_busy: 0,
+            sessions_failed: 0,
+            offline_requests: 0,
+            offline_completed: 0,
+            offline_failed: 0,
+            offline_cancelled: 0,
+            offline_busy: 0,
+            turns: 0,
+            interruptions: 0,
+            cancellations: 0,
+            busy_responses: 0,
+            tool_requests: 0,
+            tool_failures: 0,
+            tool_parallel_rejections: 0,
+            audio_duration_seconds: 0,
+            output_audio_duration_seconds: 0,
+            first_transcript_latency_seconds: 0,
+            first_text_latency_seconds: 0,
+            first_audio_latency_seconds: 0,
+            turn_latency_seconds: 0,
+            session_terminal_states: {
+                done: 0,
+                cancelled: 0,
+                disconnected: 0,
+                busy: 0,
+                error: 0,
+            },
+            offline_sts: {
+                requests: 0,
+                completed: 0,
+                failed: 0,
+                cancelled: 0,
+                busy: 0,
+            },
+            tool_outcomes: {
+                requested: 0,
+                failed: 0,
+                parallel_rejected: 0,
+            },
+            audio: {
+                input_duration_seconds: 0,
+                output_duration_seconds: 0,
+                duration_seconds: 0,
+            },
+            latency: {
+                first_transcript_seconds: 0,
+                first_text_seconds: 0,
+                first_audio_seconds: 0,
+                turn_seconds: 0,
+            },
+        };
+    }
+
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
     const MODELS_SORT_DEFAULT = { by: 'id', order: 'asc' };
@@ -334,6 +393,14 @@
                 avg_generation_tps: 0.0,
                 total_requests: 0,
             },
+            voicechatMetrics: emptyVoiceChatMetrics(),
+            alltimeVoicechatMetrics: emptyVoiceChatMetrics(),
+            voicechatMetricsState: 'loading',
+            alltimeVoicechatMetricsState: 'loading',
+            voicechatMetricsError: '',
+            alltimeVoicechatMetricsError: '',
+            voicechatMetricsLoaded: false,
+            alltimeVoicechatMetricsLoaded: false,
             // Server connectivity info (from /admin/api/server-info)
             serverAliases: [],
             selectedAlias: '',
@@ -8747,6 +8814,17 @@
                 return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
             },
 
+            get voicechatStatsModels() {
+                return this.models.filter(m => m.realtime_voicechat === true);
+            },
+
+            get statsModels() {
+                const models = [...this.llmModels, ...this.voicechatStatsModels];
+                return models.filter((model, index, all) =>
+                    all.findIndex(item => item.id === model.id) === index
+                );
+            },
+
             shellQuote(value) {
                 const s = String(value ?? '');
                 if (!s) return "''";
@@ -8955,6 +9033,9 @@
             },
 
             async loadStats(includeAlltime = true) {
+                if (includeAlltime || !this.voicechatMetricsLoaded) {
+                    this.voicechatMetricsState = 'loading';
+                }
                 try {
                     const params = new URLSearchParams();
                     if (this.selectedStatsModel) {
@@ -8965,14 +9046,25 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
+                        this.setVoicechatMetrics('session', data.voicechat_metrics);
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        this.setVoicechatMetricsError('session');
                     }
+                } catch (err) {
+                    console.error('Failed to load stats:', err);
+                    this.setVoicechatMetricsError('session');
+                }
 
-                    if (!includeAlltime) {
-                        return;
-                    }
+                if (!includeAlltime) {
+                    return;
+                }
 
+                if (includeAlltime || !this.alltimeVoicechatMetricsLoaded) {
+                    this.alltimeVoicechatMetricsState = 'loading';
+                }
+                try {
                     // Load all-time stats
                     const alltimeParams = new URLSearchParams({ scope: 'alltime' });
                     if (this.selectedStatsModel) {
@@ -8983,9 +9075,106 @@
                     if (alltimeResponse.ok) {
                         const alltimeData = await alltimeResponse.json();
                         this.alltimeStats = { ...this.alltimeStats, ...alltimeData };
+                        this.setVoicechatMetrics('alltime', alltimeData.voicechat_metrics);
+                    } else if (alltimeResponse.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        this.setVoicechatMetricsError('alltime');
                     }
                 } catch (err) {
-                    console.error('Failed to load stats:', err);
+                    console.error('Failed to load all-time stats:', err);
+                    this.setVoicechatMetricsError('alltime');
+                }
+            },
+
+            voicechatMetricsForScope() {
+                return this.statsScope === 'alltime'
+                    ? this.alltimeVoicechatMetrics
+                    : this.voicechatMetrics;
+            },
+
+            voicechatMetricsStateForScope() {
+                return this.statsScope === 'alltime'
+                    ? this.alltimeVoicechatMetricsState
+                    : this.voicechatMetricsState;
+            },
+
+            voicechatMetricsErrorForScope() {
+                return this.statsScope === 'alltime'
+                    ? this.alltimeVoicechatMetricsError
+                    : this.voicechatMetricsError;
+            },
+
+            voicechatMetric(metrics, field) {
+                const value = Number(metrics?.[field]);
+                return Number.isFinite(value) ? value : 0;
+            },
+
+            normalizeVoicechatMetrics(value) {
+                const empty = emptyVoiceChatMetrics();
+                if (!value || typeof value !== 'object') return empty;
+
+                const numericFields = [
+                    'sessions_started', 'sessions_completed', 'sessions_cancelled',
+                    'sessions_disconnected', 'sessions_busy', 'sessions_failed',
+                    'offline_requests', 'offline_completed', 'offline_failed',
+                    'offline_cancelled', 'offline_busy', 'turns', 'interruptions',
+                    'cancellations', 'busy_responses', 'tool_requests',
+                    'tool_failures', 'tool_parallel_rejections',
+                    'audio_duration_seconds', 'output_audio_duration_seconds',
+                    'first_transcript_latency_seconds', 'first_text_latency_seconds',
+                    'first_audio_latency_seconds', 'turn_latency_seconds',
+                ];
+                for (const field of numericFields) {
+                    const number = Number(value[field]);
+                    if (Number.isFinite(number) && number >= 0) empty[field] = number;
+                }
+
+                for (const group of ['session_terminal_states', 'offline_sts', 'tool_outcomes', 'audio', 'latency']) {
+                    if (!value[group] || typeof value[group] !== 'object') continue;
+                    for (const field of Object.keys(empty[group])) {
+                        const number = Number(value[group][field]);
+                        if (Number.isFinite(number) && number >= 0) empty[group][field] = number;
+                    }
+                }
+                return empty;
+            },
+
+            voicechatMetricsHasData(metrics) {
+                return [
+                    'sessions_started', 'sessions_completed', 'sessions_cancelled',
+                    'sessions_disconnected', 'sessions_busy', 'sessions_failed',
+                    'offline_requests', 'turns', 'interruptions', 'cancellations',
+                    'busy_responses', 'tool_requests', 'tool_failures',
+                    'tool_parallel_rejections', 'audio_duration_seconds',
+                    'output_audio_duration_seconds',
+                ].some(field => this.voicechatMetric(metrics, field) > 0);
+            },
+
+            setVoicechatMetrics(scope, value) {
+                const alltime = scope === 'alltime';
+                const metrics = this.normalizeVoicechatMetrics(value);
+                if (alltime) {
+                    this.alltimeVoicechatMetrics = metrics;
+                    this.alltimeVoicechatMetricsState = this.voicechatMetricsHasData(metrics) ? 'success' : 'empty';
+                    this.alltimeVoicechatMetricsError = '';
+                    this.alltimeVoicechatMetricsLoaded = true;
+                } else {
+                    this.voicechatMetrics = metrics;
+                    this.voicechatMetricsState = this.voicechatMetricsHasData(metrics) ? 'success' : 'empty';
+                    this.voicechatMetricsError = '';
+                    this.voicechatMetricsLoaded = true;
+                }
+            },
+
+            setVoicechatMetricsError(scope) {
+                const message = 'Unable to load VoiceChat metrics.';
+                if (scope === 'alltime') {
+                    this.alltimeVoicechatMetricsState = 'error';
+                    this.alltimeVoicechatMetricsError = message;
+                } else {
+                    this.voicechatMetricsState = 'error';
+                    this.voicechatMetricsError = message;
                 }
             },
 

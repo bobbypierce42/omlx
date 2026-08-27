@@ -134,6 +134,36 @@ def _record_audio_request(model_id: str) -> None:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
 
 
+def _audio_duration_seconds(audio_bytes: bytes) -> float:
+    """Return WAV duration without retaining or logging audio content."""
+    try:
+        sample_rate, channels, sample_width, pcm_bytes = wav_bytes_to_pcm_frames(
+            audio_bytes
+        )
+        if sample_rate <= 0 or channels <= 0 or sample_width <= 0:
+            return 0.0
+        return len(pcm_bytes) / (sample_rate * channels * sample_width)
+    except Exception:
+        return 0.0
+
+
+def _record_voicechat_offline_request(
+    model_id: str,
+    outcome: str,
+    audio_duration_seconds: float,
+) -> None:
+    try:
+        get_server_metrics().record_voicechat_offline_request(
+            model_id=model_id,
+            outcome=outcome,
+            audio_duration_seconds=audio_duration_seconds,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to record VoiceChat offline metrics: %s", type(exc).__name__
+        )
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
     chunks: list[bytes] = []
@@ -1007,11 +1037,13 @@ async def process_audio(
     get_entry = getattr(pool, "get_entry", None)
     entry = get_entry(resolved_model) if callable(get_entry) else None
     voicechat_metadata = _is_voicechat_metadata(entry)
+    voicechat_metric_enabled = voicechat_metadata
 
     # Load the engine via pool (handles model loading and LRU eviction)
     try:
         engine = await pool.get_engine(resolved_model)
     except VoiceChatBusyError as exc:
+        _record_voicechat_offline_request(resolved_model, "busy", 0.0)
         return _voicechat_busy_response(exc)
     except ModelNotFoundError as exc:
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
@@ -1021,9 +1053,16 @@ async def process_audio(
         ) from exc
     except ModelBusyError as exc:
         if voicechat_metadata:
+            _record_voicechat_offline_request(resolved_model, "busy", 0.0)
             return _voicechat_busy_response(exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        if voicechat_metric_enabled:
+            _record_voicechat_offline_request(resolved_model, "cancelled", 0.0)
+        raise
     except Exception as exc:
+        if voicechat_metric_enabled:
+            _record_voicechat_offline_request(resolved_model, "failed", 0.0)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     is_voicechat = (
@@ -1031,6 +1070,7 @@ async def process_audio(
         or isinstance(engine, VoiceChatEngine)
         or _is_voicechat_metadata(engine)
     )
+    voicechat_metric_enabled = is_voicechat
     if not is_voicechat and not isinstance(engine, STSEngine):
         raise HTTPException(
             status_code=400,
@@ -1044,22 +1084,31 @@ async def process_audio(
     if suffix.lower() in _VIDEO_CONTAINERS:
         suffix = ".m4a"
     tmp_path = None
+    offline_outcome = "failed"
+    audio_duration_seconds = 0.0
     try:
         content = await _read_upload(file)
         if not content:
             raise HTTPException(status_code=400, detail="Audio file is empty")
+        audio_duration_seconds = _audio_duration_seconds(content)
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             tmp.write(content)
 
         wav_bytes = await engine.process(tmp_path)
         wav_bytes = _validate_wav_output(wav_bytes)
+        offline_outcome = "completed"
     except VoiceChatBusyError as exc:
+        offline_outcome = "busy"
         return _voicechat_busy_response(exc)
     except ModelBusyError as exc:
         if is_voicechat:
+            offline_outcome = "busy"
             return _voicechat_busy_response(exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except asyncio.CancelledError:
+        offline_outcome = "cancelled"
+        raise
     except HTTPException:
         raise
     except Exception as exc:
@@ -1070,6 +1119,12 @@ async def process_audio(
                 os.unlink(tmp_path)
             except OSError:
                 pass
+        if voicechat_metric_enabled:
+            _record_voicechat_offline_request(
+                resolved_model,
+                offline_outcome,
+                audio_duration_seconds,
+            )
 
     _record_audio_request(resolved_model)
 

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from omlx.server_metrics import ServerMetrics, get_server_metrics, reset_server_metrics
+from omlx.server_metrics import (
+    VOICECHAT_ALLOWED_PROPERTIES,
+    ServerMetrics,
+    get_server_metrics,
+    reset_server_metrics,
+)
 
 
 class TestServerMetrics:
@@ -476,6 +481,184 @@ class TestAlltimePersistence:
         tmp_file = stats_path.with_suffix(".json.tmp")
         assert not tmp_file.exists()
         assert stats_path.exists()
+
+
+class TestVoiceChatMetrics:
+    """Tests for local VoiceChat operational metrics."""
+
+    def test_allowlist_excludes_content_and_credentials(self):
+        forbidden = {
+            "raw_audio",
+            "transcript",
+            "prompt",
+            "instructions",
+            "tools",
+            "arguments",
+            "results",
+            "keys",
+            "credential",
+        }
+        assert not forbidden & {
+            property_name.lower() for property_name in VOICECHAT_ALLOWED_PROPERTIES
+        }
+
+        metrics = ServerMetrics()
+        metrics.record_voicechat_event("transcript", model_id="voice-model")
+        assert (
+            metrics.get_voicechat_snapshot(model_id="voice-model")["sessions_started"]
+            == 0
+        )
+
+    def test_terminal_paths_and_operational_counters(self):
+        metrics = ServerMetrics()
+        for terminal_state in ("done", "cancelled", "disconnected", "busy", "error"):
+            metrics.record_voicechat_session_terminal(
+                terminal_state,
+                model_id="voice-model",
+            )
+        metrics.record_voicechat_session_started(model_id="voice-model")
+        metrics.record_voicechat_offline_request(
+            model_id="voice-model",
+            outcome="completed",
+            audio_duration_seconds=1.5,
+        )
+        metrics.record_voicechat_tool("requested", model_id="voice-model")
+        metrics.record_voicechat_tool("failed", model_id="voice-model")
+        metrics.record_voicechat_tool("parallel_rejected", model_id="voice-model")
+        metrics.record_voicechat_tool("completed", model_id="voice-model")
+        metrics.record_voicechat_tool("timeout", model_id="voice-model")
+
+        snapshot = metrics.get_voicechat_snapshot(model_id="voice-model")
+
+        assert snapshot["sessions_started"] == 1
+        assert snapshot["session_terminal_states"] == {
+            "done": 1,
+            "cancelled": 1,
+            "disconnected": 1,
+            "busy": 1,
+            "error": 1,
+        }
+        assert snapshot["offline_sts"]["requests"] == 1
+        assert snapshot["offline_sts"]["completed"] == 1
+        assert snapshot["audio"]["input_duration_seconds"] == pytest.approx(1.5)
+        assert snapshot["busy_responses"] == 1
+        assert snapshot["tool_outcomes"] == {
+            "requested": 1,
+            "failed": 1,
+            "parallel_rejected": 1,
+        }
+
+    def test_latency_and_turns_are_aggregated(self):
+        metrics = ServerMetrics()
+        metrics.record_voicechat_session_terminal(
+            "done",
+            model_id="model-a",
+            turns=2,
+            interruptions=1,
+            cancellations=1,
+            audio_duration_seconds=2.0,
+            output_audio_duration_seconds=3.0,
+            first_transcript_latency_seconds=0.2,
+            first_text_latency_seconds=0.4,
+            first_audio_latency_seconds=0.6,
+            turn_latency_seconds=1.2,
+        )
+        metrics.record_voicechat_session_terminal(
+            "done",
+            model_id="model-a",
+            first_audio_latency_seconds=0.8,
+        )
+
+        snapshot = metrics.get_voicechat_snapshot(model_id="model-a")
+
+        assert snapshot["turns"] == 2
+        assert snapshot["interruptions"] == 1
+        assert snapshot["cancellations"] == 1
+        assert snapshot["audio"]["duration_seconds"] == pytest.approx(5.0)
+        assert snapshot["latency"]["first_transcript_seconds"] == pytest.approx(0.2)
+        assert snapshot["latency"]["first_text_seconds"] == pytest.approx(0.4)
+        assert snapshot["latency"]["first_audio_seconds"] == pytest.approx(0.7)
+        assert snapshot["latency"]["turn_seconds"] == pytest.approx(1.2)
+
+    def test_per_model_scope_and_unknown_models_are_isolated(self):
+        metrics = ServerMetrics()
+        metrics.record_voicechat_session_started(model_id="model-a")
+        metrics.record_voicechat_session_started(model_id="model-b")
+        metrics.record_voicechat_session_terminal("done", model_id="model-a")
+
+        model_a = metrics.get_voicechat_snapshot(model_id="model-a")
+        model_b = metrics.get_voicechat_snapshot(model_id="model-b")
+        global_snapshot = metrics.get_voicechat_snapshot()
+        unknown = metrics.get_voicechat_snapshot(model_id="missing")
+
+        assert model_a["sessions_started"] == 1
+        assert model_a["session_terminal_states"]["done"] == 1
+        assert model_b["sessions_started"] == 1
+        assert model_b["session_terminal_states"]["done"] == 0
+        assert global_snapshot["sessions_started"] == 2
+        assert global_snapshot["session_terminal_states"]["done"] == 1
+        assert unknown["sessions_started"] == 0
+        assert unknown["session_terminal_states"]["done"] == 0
+
+    def test_persistence_and_legacy_missing_fields(self, tmp_path):
+        stats_path = tmp_path / "stats.json"
+        metrics = ServerMetrics(stats_path=stats_path)
+        metrics.record_voicechat_session_terminal(
+            "done",
+            model_id="voice-model",
+            first_audio_latency_seconds=0.75,
+        )
+        metrics.save_alltime()
+
+        persisted = json.loads(stats_path.read_text())
+        assert persisted["voicechat"]["per_model"]["voice-model"]
+        persisted_keys = set(persisted["voicechat"]["aggregate"])
+        assert not persisted_keys & {
+            "raw_audio",
+            "transcript",
+            "prompt",
+            "instructions",
+            "tools",
+            "arguments",
+            "results",
+            "api_key",
+            "credentials",
+        }
+
+        restored = ServerMetrics(stats_path=stats_path)
+        assert (
+            restored.get_voicechat_snapshot(scope="alltime")["session_terminal_states"][
+                "done"
+            ]
+            == 1
+        )
+        assert restored.get_voicechat_snapshot(model_id="voice-model", scope="alltime")[
+            "latency"
+        ]["first_audio_seconds"] == pytest.approx(0.75)
+
+        legacy_path = tmp_path / "legacy.json"
+        legacy_path.write_text(json.dumps({"total_requests": 9}))
+        legacy = ServerMetrics(stats_path=legacy_path)
+        assert legacy.get_voicechat_snapshot(scope="alltime")["sessions_started"] == 0
+        assert (
+            legacy.get_voicechat_snapshot(scope="alltime")["offline_sts"]["requests"]
+            == 0
+        )
+
+    def test_clear_session_and_alltime_voicechat_metrics(self, tmp_path):
+        stats_path = tmp_path / "stats.json"
+        metrics = ServerMetrics(stats_path=stats_path)
+        metrics.record_voicechat_session_started(model_id="voice-model")
+        metrics.record_voicechat_session_terminal("done", model_id="voice-model")
+        metrics.save_alltime()
+
+        metrics.clear_metrics()
+        assert metrics.get_voicechat_snapshot()["sessions_started"] == 0
+        assert metrics.get_voicechat_snapshot(scope="alltime")["sessions_started"] == 1
+
+        metrics.clear_alltime_metrics()
+        assert metrics.get_voicechat_snapshot(scope="alltime")["sessions_started"] == 0
+        assert not stats_path.exists()
 
 
 class TestServerMetricsSingleton:

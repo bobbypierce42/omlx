@@ -11,6 +11,7 @@ import inspect
 import json
 import math
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -111,6 +112,7 @@ class _RealtimeRuntime:
     engine: Any
     settings: _SessionSettings
     session_id: str
+    model_id: str
     native_input_sample_rate: int
     native_output_sample_rate: int
     frame_samples: int
@@ -120,6 +122,20 @@ class _RealtimeRuntime:
         default_factory=lambda: np.zeros(0, dtype=np.float32)
     )
     function_call: _FunctionCallState | None = None
+    first_input_at: float | None = None
+    input_audio_duration_seconds: float = 0.0
+    output_audio_duration_seconds: float = 0.0
+    first_transcript_latency_seconds: float | None = None
+    first_text_latency_seconds: float | None = None
+    first_audio_latency_seconds: float | None = None
+    turn_latency_seconds: float | None = None
+    turns: int = 0
+    interruptions: int = 0
+    cancellations: int = 0
+    tool_requests: int = 0
+    tool_failures: int = 0
+    tool_parallel_rejections: int = 0
+    terminal_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +220,50 @@ def _new_event_id() -> str:
 
 def _new_session_id() -> str:
     return f"sess_{uuid.uuid4().hex[:16]}"
+
+
+def _record_voicechat_metric(method: str, *args: Any, **kwargs: Any) -> None:
+    """Keep metrics fail-soft so persistence never interrupts a session."""
+    try:
+        from ..server_metrics import get_server_metrics
+
+        recorder = getattr(get_server_metrics(), method, None)
+        if callable(recorder):
+            recorder(*args, **kwargs)
+    except Exception:
+        return
+
+
+def _sample_count(samples: Any) -> int:
+    size = getattr(samples, "size", None)
+    if size is not None:
+        try:
+            return max(0, int(size))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    try:
+        return max(0, len(samples))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _terminal_state_from_events(events: Any) -> str | None:
+    for event in normalize_voicechat_events(events):
+        kind = event.type
+        if kind == VoiceChatEventKind.ERROR.value:
+            return "error"
+        if kind == VoiceChatEventKind.BUSY.value:
+            return "busy"
+        if kind == VoiceChatEventKind.CANCELLED.value:
+            return "cancelled"
+        if kind == VoiceChatEventKind.DONE.value:
+            return "completed"
+    return None
+
+
+def _set_runtime_terminal(runtime: _RealtimeRuntime, state: str) -> None:
+    if runtime.terminal_state is None:
+        runtime.terminal_state = state
 
 
 def _safe_message(value: Any, fallback: str = "realtime request failed") -> str:
@@ -1044,6 +1104,7 @@ async def _open_runtime(
         engine=engine,
         settings=settings,
         session_id=session_id,
+        model_id=resolved_model,
         native_input_sample_rate=native_input_rate,
         native_output_sample_rate=native_output_rate,
         frame_samples=frame_samples,
@@ -1306,7 +1367,33 @@ async def _send_model_events(
             "assistant_text_delta": VoiceChatEventKind.ASSISTANT_TEXT.value,
             "function_delta": VoiceChatEventKind.FUNCTION.value,
         }.get(event.type, event.type)
+        if runtime is not None and runtime.first_input_at is not None:
+            elapsed = max(0.0, time.perf_counter() - runtime.first_input_at)
+            if kind == VoiceChatEventKind.TRANSCRIPT.value and (
+                event.delta or event.text
+            ):
+                if runtime.first_transcript_latency_seconds is None:
+                    runtime.first_transcript_latency_seconds = elapsed
+            elif kind == VoiceChatEventKind.ASSISTANT_TEXT.value and (
+                event.delta or event.text
+            ):
+                if runtime.first_text_latency_seconds is None:
+                    runtime.first_text_latency_seconds = elapsed
+        if runtime is not None and kind == VoiceChatEventKind.AUDIO.value:
+            count = _sample_count(event.samples)
+            rate = event.sample_rate or runtime.native_output_sample_rate
+            if count and rate > 0:
+                runtime.output_audio_duration_seconds += count / rate
+                if (
+                    runtime.first_input_at is not None
+                    and runtime.first_audio_latency_seconds is None
+                ):
+                    runtime.first_audio_latency_seconds = max(
+                        0.0, time.perf_counter() - runtime.first_input_at
+                    )
         if kind == VoiceChatEventKind.ERROR.value:
+            if runtime is not None:
+                _set_runtime_terminal(runtime, "error")
             await _send_error(
                 websocket,
                 event.error or "VoiceChat inference failed",
@@ -1315,6 +1402,8 @@ async def _send_model_events(
             terminal = True
             continue
         if kind == VoiceChatEventKind.BUSY.value:
+            if runtime is not None:
+                _set_runtime_terminal(runtime, "busy")
             await _send_error(
                 websocket,
                 event.error or "another realtime VoiceChat session is active",
@@ -1328,9 +1417,20 @@ async def _send_model_events(
                     "function events require an active VoiceChat runtime",
                     code="protocol",
                 )
+            was_new_call = runtime.function_call is None
+            if event.parallel:
+                runtime.tool_parallel_rejections += 1
+            try:
+                function_payload = _function_delta_payload(runtime, event)
+            except _RealtimeProtocolError:
+                if not event.parallel:
+                    runtime.tool_failures += 1
+                raise
+            if was_new_call and not event.parallel:
+                runtime.tool_requests += 1
             await _send_event(
                 websocket,
-                _function_delta_payload(runtime, event),
+                function_payload,
             )
             continue
         if kind == VoiceChatEventKind.DONE.value and runtime is not None:
@@ -1346,6 +1446,13 @@ async def _send_model_events(
             VoiceChatEventKind.DONE.value,
             VoiceChatEventKind.CANCELLED.value,
         }:
+            if runtime is not None:
+                _set_runtime_terminal(
+                    runtime,
+                    "completed"
+                    if kind == VoiceChatEventKind.DONE.value
+                    else "cancelled",
+                )
             if kind == VoiceChatEventKind.CANCELLED.value and runtime is not None:
                 runtime.function_call = None
             terminal = True
@@ -1385,6 +1492,13 @@ async def _push_samples(
     samples: np.ndarray,
 ) -> bool:
     runtime.received_audio = runtime.received_audio or samples.size > 0
+    if samples.size:
+        if runtime.first_input_at is None:
+            runtime.first_input_at = time.perf_counter()
+            runtime.turns += 1
+        runtime.input_audio_duration_seconds += (
+            samples.size / runtime.settings.input_sample_rate
+        )
     for start in range(0, samples.size, _MAX_RESAMPLE_INPUT_SAMPLES):
         native_samples = runtime.input_resampler.push(
             samples[start : start + _MAX_RESAMPLE_INPUT_SAMPLES]
@@ -1474,6 +1588,10 @@ async def _handle_client_message(
         await _send_event(websocket, {"type": "session.pong"})
         return False
     if message_type in {"session.cancel", "response.cancel"}:
+        _set_runtime_terminal(runtime, "cancelled")
+        runtime.cancellations += 1
+        if message_type == "response.cancel":
+            runtime.interruptions += 1
         events = await _maybe_await(runtime.session.cancel())
         terminal = await _send_model_events(
             websocket,
@@ -1544,6 +1662,10 @@ async def _handle_client_message(
                 client_event_id=client_event_id,
             )
             return False
+        if runtime.first_input_at is not None:
+            runtime.turn_latency_seconds = max(
+                0.0, time.perf_counter() - runtime.first_input_at
+            )
         await _send_event(websocket, {"type": "input_audio_buffer.committed"})
         if await _push_native_samples(
             websocket,
@@ -1554,18 +1676,21 @@ async def _handle_client_message(
         events = await _maybe_await(
             runtime.session.flush(pad_partial=commit.pad_partial)
         )
-        await _send_model_events(
+        terminal = await _send_model_events(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
             runtime=runtime,
         )
+        if not terminal and runtime.terminal_state is None:
+            _set_runtime_terminal(runtime, "completed")
         return True
     if message_type == "response.create":
         try:
             response = RealtimeResponseCreate.model_validate(payload)
             response_config = response.response or {}
             if response_config.get("parallel_tool_calls"):
+                runtime.tool_parallel_rejections += 1
                 raise _RealtimeProtocolError(
                     "parallel tool calls are not supported",
                     code="unsupported_operation",
@@ -1613,6 +1738,7 @@ async def _handle_client_message(
             item_event = RealtimeConversationItemCreate.model_validate(payload)
             item = item_event.item
             if item.get("type") == "function_call_output" or "output" in item:
+                runtime.tool_failures += 1
                 raise _RealtimeProtocolError(
                     "tool results are not supported by this VoiceChat backend",
                     code="unsupported_operation",
@@ -1651,6 +1777,10 @@ async def _handle_client_message(
         if not runtime.received_audio:
             await _send_error(websocket, "cannot commit an empty input audio buffer")
             return False
+        if runtime.first_input_at is not None:
+            runtime.turn_latency_seconds = max(
+                0.0, time.perf_counter() - runtime.first_input_at
+            )
         await _send_event(websocket, {"type": "input_audio_buffer.committed"})
         if await _push_native_samples(
             websocket,
@@ -1659,12 +1789,14 @@ async def _handle_client_message(
         ):
             return True
         events = await _maybe_await(runtime.session.flush(pad_partial=True))
-        await _send_model_events(
+        terminal = await _send_model_events(
             websocket,
             events,
             output_sample_rate=runtime.settings.output_sample_rate,
             runtime=runtime,
         )
+        if not terminal and runtime.terminal_state is None:
+            _set_runtime_terminal(runtime, "completed")
         return True
 
     await _send_error(
@@ -1686,6 +1818,40 @@ async def _close_runtime(runtime: _RealtimeRuntime | None) -> None:
             result = close()
             if inspect.isawaitable(result):
                 await asyncio.shield(result)
+
+
+def _record_realtime_terminal(
+    runtime: _RealtimeRuntime | None,
+    terminal_state: str,
+    model_id: str = "",
+) -> None:
+    if runtime is None:
+        _record_voicechat_metric(
+            "record_voicechat_session_terminal",
+            terminal_state,
+            model_id=model_id,
+        )
+        return
+    turn_latency = runtime.turn_latency_seconds
+    if turn_latency is None and runtime.first_input_at is not None:
+        turn_latency = max(0.0, time.perf_counter() - runtime.first_input_at)
+    _record_voicechat_metric(
+        "record_voicechat_session_terminal",
+        runtime.terminal_state or terminal_state,
+        model_id=runtime.model_id,
+        turns=runtime.turns,
+        interruptions=runtime.interruptions,
+        cancellations=runtime.cancellations,
+        audio_duration_seconds=runtime.input_audio_duration_seconds,
+        output_audio_duration_seconds=runtime.output_audio_duration_seconds,
+        first_transcript_latency_seconds=runtime.first_transcript_latency_seconds,
+        first_text_latency_seconds=runtime.first_text_latency_seconds,
+        first_audio_latency_seconds=runtime.first_audio_latency_seconds,
+        turn_latency_seconds=turn_latency,
+        tool_requests=runtime.tool_requests,
+        tool_failures=runtime.tool_failures,
+        tool_parallel_rejections=runtime.tool_parallel_rejections,
+    )
 
 
 async def _send_session_created(
@@ -1723,6 +1889,8 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
     seen_event_ids: set[str] = set()
     control = _RealtimeControl()
     socket_closed = False
+    terminal_state: str | None = None
+    metric_model_id = ""
 
     async def close_socket(code: int = 1000) -> None:
         nonlocal socket_closed
@@ -1734,9 +1902,13 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
 
     try:
         first: dict[str, Any] | None = None
+        query_model = websocket.query_params.get("model") or None
+        start_model = query_model
+        metric_model_id = start_model or ""
         header_key = _header_api_key(websocket)
         if header_key is not None:
             if not _verify_ws_auth(websocket):
+                terminal_state = "error"
                 await _send_error(
                     websocket,
                     "invalid API key",
@@ -1748,8 +1920,10 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             try:
                 first = await _receive_payload(websocket)
             except WebSocketDisconnect:
+                terminal_state = "disconnected"
                 return
             except _RealtimeProtocolError:
+                terminal_state = "error"
                 await _send_error(
                     websocket,
                     "invalid API key",
@@ -1757,7 +1931,10 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
                 )
                 await close_socket(_AUTH_CLOSE_CODE)
                 return
+            if isinstance(first.get("model"), str):
+                metric_model_id = first["model"].strip()
             if not _verify_ws_auth(websocket, first.get("api_key")):
+                terminal_state = "error"
                 await _send_error(
                     websocket,
                     "invalid API key",
@@ -1771,13 +1948,12 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
                 await close_socket(_AUTH_CLOSE_CODE)
                 return
 
-        query_model = websocket.query_params.get("model") or None
-        start_model = query_model
         await _send_session_created(websocket, session_id, start_model)
 
         if first is not None and first.get("type") == "start":
             if isinstance(first.get("model"), str) and first["model"].strip():
                 start_model = first["model"].strip()
+                metric_model_id = start_model
             first = None
 
         while True:
@@ -1785,12 +1961,14 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
                 try:
                     first = await _receive_payload(websocket)
                 except WebSocketDisconnect:
+                    terminal_state = "disconnected"
                     return
                 except _RealtimeProtocolError as exc:
                     await _send_error(
                         websocket, str(exc), code=exc.code, param=exc.param
                     )
                     if exc.code == "timeout":
+                        terminal_state = "error"
                         await close_socket(_AUTH_CLOSE_CODE)
                         return
                     continue
@@ -1835,6 +2013,9 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
                 first = None
                 continue
             del update
+            metric_model_id = settings.model
+            with contextlib.suppress(Exception):
+                metric_model_id = _resolve_model(settings.model)
             break
 
         queue: asyncio.Queue[_InboundMessage] = asyncio.Queue(
@@ -1846,6 +2027,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
         try:
             pool = _get_engine_pool()
         except HTTPException as exc:
+            terminal_state = "error"
             await _send_error(
                 websocket,
                 str(exc.detail),
@@ -1861,6 +2043,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             {reader_task, startup_task}, return_when=asyncio.FIRST_COMPLETED
         )
         if reader_task in done and not startup_task.done():
+            terminal_state = "disconnected"
             startup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await startup_task
@@ -1868,6 +2051,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
         try:
             runtime = startup_task.result()
         except VoiceChatBusyError:
+            terminal_state = "busy"
             await _send_error(
                 websocket,
                 "another realtime VoiceChat session is already active",
@@ -1876,6 +2060,7 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             await close_socket(_BUSY_CLOSE_CODE)
             return
         except _RealtimeProtocolError as exc:
+            terminal_state = "error"
             await _send_error(
                 websocket,
                 str(exc),
@@ -1885,8 +2070,10 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             await close_socket(exc.close_code or _SERVER_CLOSE_CODE)
             return
         except asyncio.CancelledError:
+            terminal_state = "cancelled"
             return
         except Exception:
+            terminal_state = "error"
             await _send_error(
                 websocket,
                 "VoiceChat session initialization failed",
@@ -1894,6 +2081,11 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             )
             await close_socket(_SERVER_CLOSE_CODE)
             return
+
+        _record_voicechat_metric(
+            "record_voicechat_session_started",
+            model_id=runtime.model_id,
+        )
 
         await _send_event(
             websocket,
@@ -1930,9 +2122,20 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await processor_task
     except WebSocketDisconnect:
+        terminal_state = "disconnected"
         return
-    except (RuntimeError, asyncio.CancelledError):
+    except asyncio.CancelledError:
+        terminal_state = "cancelled"
+        if runtime is not None:
+            _set_runtime_terminal(runtime, "cancelled")
+            runtime.cancellations += 1
         return
+    except RuntimeError:
+        terminal_state = "disconnected"
+        return
+    except Exception:
+        terminal_state = "error"
+        raise
     finally:
         for task in (reader_task, processor_task):
             if task is not None and not task.done():
@@ -1946,6 +2149,11 @@ async def realtime_voicechat(websocket: WebSocket) -> None:
             with contextlib.suppress(BaseException):
                 await startup_task
         await _close_runtime(runtime)
+        _record_realtime_terminal(
+            runtime,
+            terminal_state or "disconnected",
+            metric_model_id,
+        )
         await close_socket()
 
 
@@ -1963,6 +2171,10 @@ async def _cancel_runtime(
             _validate_event_id(payload, seen_event_ids)
         except _RealtimeProtocolError as exc:
             await _send_error(websocket, str(exc), code=exc.code, param=exc.param)
+    _set_runtime_terminal(runtime, "cancelled")
+    runtime.cancellations += 1
+    if payload is not None and payload.get("type") == "response.cancel":
+        runtime.interruptions += 1
     events = await _maybe_await(runtime.session.cancel())
     terminal = await _send_model_events(
         websocket,
@@ -2059,6 +2271,7 @@ async def _process_realtime_queue(
                     control,
                 )
         except VoiceChatBusyError:
+            _set_runtime_terminal(runtime, "busy")
             await _send_error(
                 websocket,
                 "another realtime VoiceChat session is already active",
@@ -2071,6 +2284,8 @@ async def _process_realtime_queue(
                     await close_socket(_BUSY_CLOSE_CODE)
             return
         except _RealtimeProtocolError as exc:
+            if exc.close_code is not None:
+                _set_runtime_terminal(runtime, "error")
             await _send_error(
                 websocket,
                 str(exc),
@@ -2089,6 +2304,7 @@ async def _process_realtime_queue(
         except asyncio.CancelledError:
             raise
         except Exception:
+            _set_runtime_terminal(runtime, "error")
             await _send_error(
                 websocket,
                 "VoiceChat inference failed",

@@ -702,3 +702,61 @@ def test_session_content_is_not_written_to_trace_logs(caplog):
             assert websocket.receive_json()["type"] == "response.cancelled"
             websocket.__exit__(None, None, None)
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    ["completed", "cancelled", "disconnected", "busy", "error"],
+)
+def test_realtime_terminal_finalizer_records_each_terminal_path(terminal_state):
+    import omlx.api.realtime_routes as routes
+
+    with patch.object(routes, "_record_voicechat_metric") as record:
+        routes._record_realtime_terminal(None, terminal_state, "voice-model")
+
+    record.assert_called_once_with(
+        "record_voicechat_session_terminal",
+        terminal_state,
+        model_id="voice-model",
+    )
+
+
+def test_realtime_terminal_finalizer_records_only_operational_runtime_fields():
+    import omlx.api.realtime_routes as routes
+
+    runtime = SimpleNamespace(
+        terminal_state="completed",
+        model_id="voice-model",
+        turns=2,
+        interruptions=1,
+        cancellations=1,
+        input_audio_duration_seconds=1.5,
+        output_audio_duration_seconds=2.5,
+        first_transcript_latency_seconds=0.2,
+        first_text_latency_seconds=0.4,
+        first_audio_latency_seconds=0.6,
+        turn_latency_seconds=1.0,
+        tool_requests=1,
+        tool_failures=1,
+        tool_parallel_rejections=1,
+    )
+    with patch.object(routes, "_record_voicechat_metric") as record:
+        routes._record_realtime_terminal(runtime, "disconnected")
+
+    record.assert_called_once_with(
+        "record_voicechat_session_terminal",
+        "completed",
+        model_id="voice-model",
+        turns=2,
+        interruptions=1,
+        cancellations=1,
+        audio_duration_seconds=1.5,
+        output_audio_duration_seconds=2.5,
+        first_transcript_latency_seconds=0.2,
+        first_text_latency_seconds=0.4,
+        first_audio_latency_seconds=0.6,
+        turn_latency_seconds=1.0,
+        tool_requests=1,
+        tool_failures=1,
+        tool_parallel_rejections=1,
+    )

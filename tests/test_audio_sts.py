@@ -258,11 +258,13 @@ class TestVoiceChatEndpoint:
 
     def test_voicechat_process_returns_playable_wav(self, voicechat_client):
         client, _, voicechat = voicechat_client
-        response = client.post(
-            "/v1/audio/process",
-            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
-            data={"model": "voicechat"},
-        )
+        metrics = MagicMock()
+        with patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics):
+            response = client.post(
+                "/v1/audio/process",
+                files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+                data={"model": "voicechat"},
+            )
 
         assert response.status_code == 200
         assert response.headers["content-type"] == "audio/wav"
@@ -273,6 +275,27 @@ class TestVoiceChatEndpoint:
         voicechat.process.assert_awaited_once()
         temp_path = voicechat.process.await_args.args[0]
         assert not os.path.exists(temp_path)
+        metrics.record_voicechat_offline_request.assert_called_once()
+        metric_kwargs = metrics.record_voicechat_offline_request.call_args.kwargs
+        assert metric_kwargs["model_id"] == "voicechat"
+        assert metric_kwargs["outcome"] == "completed"
+        assert metric_kwargs["audio_duration_seconds"] == pytest.approx(0.1)
+
+    def test_voicechat_process_records_failed_metric(self, voicechat_client):
+        client, _, voicechat = voicechat_client
+        voicechat.process.side_effect = RuntimeError("processing failed")
+        metrics = MagicMock()
+        with patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics):
+            response = client.post(
+                "/v1/audio/process",
+                files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+                data={"model": "voicechat"},
+            )
+
+        assert response.status_code >= 500
+        metric_kwargs = metrics.record_voicechat_offline_request.call_args.kwargs
+        assert metric_kwargs["outcome"] == "failed"
+        assert metric_kwargs["audio_duration_seconds"] == pytest.approx(0.1)
 
     def test_empty_audio_is_rejected_before_inference(self, voicechat_client):
         client, _, voicechat = voicechat_client
@@ -300,32 +323,44 @@ class TestVoiceChatEndpoint:
     def test_voicechat_load_failure_returns_server_error(self, voicechat_client):
         client, pool, _ = voicechat_client
         pool.get_engine.side_effect = RuntimeError("voicechat load failed")
+        metrics = MagicMock()
 
-        response = client.post(
-            "/v1/audio/process",
-            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
-            data={"model": "voicechat"},
-        )
+        with patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics):
+            response = client.post(
+                "/v1/audio/process",
+                files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+                data={"model": "voicechat"},
+            )
 
         assert response.status_code >= 500
+        assert (
+            metrics.record_voicechat_offline_request.call_args.kwargs["outcome"]
+            == "failed"
+        )
 
     def test_voicechat_busy_returns_retryable_503(self, voicechat_client):
         from omlx.engine.voicechat import VoiceChatBusyError
 
         client, _, voicechat = voicechat_client
         voicechat.process.side_effect = VoiceChatBusyError()
+        metrics = MagicMock()
 
-        response = client.post(
-            "/v1/audio/process",
-            files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
-            data={"model": "voicechat"},
-        )
+        with patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics):
+            response = client.post(
+                "/v1/audio/process",
+                files={"file": ("recorded.wav", TINY_WAV, "audio/wav")},
+                data={"model": "voicechat"},
+            )
 
         assert response.status_code == 503
         assert response.headers["retry-after"] == "1"
         error = response.json()["error"]
         assert error["code"] == "busy"
         assert error["retryable"] is True
+        assert (
+            metrics.record_voicechat_offline_request.call_args.kwargs["outcome"]
+            == "busy"
+        )
 
     def test_client_disconnect_cleans_uploaded_tempfile(self):
         from fastapi import UploadFile
@@ -351,6 +386,7 @@ class TestVoiceChatEndpoint:
             await asyncio.Future()
 
         voicechat.process.side_effect = blocked_process
+        metrics = MagicMock()
 
         async def run_request():
             with (
@@ -359,6 +395,7 @@ class TestVoiceChatEndpoint:
                     "omlx.api.audio_routes._resolve_model",
                     side_effect=lambda model: model,
                 ),
+                patch("omlx.api.audio_routes.get_server_metrics", return_value=metrics),
             ):
                 upload = UploadFile(file=io.BytesIO(TINY_WAV), filename="audio.wav")
                 request = asyncio.create_task(process_audio(upload, "voicechat"))
@@ -369,6 +406,10 @@ class TestVoiceChatEndpoint:
 
         asyncio.run(run_request())
         assert not os.path.exists(state["path"])
+        assert (
+            metrics.record_voicechat_offline_request.call_args.kwargs["outcome"]
+            == "cancelled"
+        )
 
     def test_invalid_engine_output_returns_server_error(self, voicechat_client):
         client, _, voicechat = voicechat_client

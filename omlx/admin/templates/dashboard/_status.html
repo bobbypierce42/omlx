@@ -46,7 +46,7 @@
                                     @change="loadStats()"
                                     class="px-3 py-1.5 text-xs font-medium border border-neutral-200 rounded-lg bg-white focus:ring-2 focus:ring-neutral-900 focus:border-neutral-900 transition-all">
                                 <option value="">{{ t('status.filter_all_models') }}</option>
-                                <template x-for="m in llmModels" :key="m.id">
+                                <template x-for="m in statsModels" :key="m.id">
                                     <option :value="m.id" x-text="m.id"></option>
                                 </template>
                             </select>
@@ -96,6 +96,74 @@
                             <div class="p-6">
                                 <p class="text-xs text-neutral-500 mb-1">{{ t('status.speed.token_generation') }}</p>
                                 <p class="text-2xl font-bold text-neutral-900" x-text="(statsScope === 'alltime' ? alltimeStats : stats).avg_generation_tps.toFixed(1) + ' tok/s'"></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- VoiceChat Metrics -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-8">
+                        <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <div class="flex items-center gap-3">
+                                <i data-lucide="audio-lines" class="w-4 h-4 text-neutral-500"></i>
+                                <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">VoiceChat Metrics</span>
+                            </div>
+                            <span class="text-[11px] text-neutral-400" x-text="statsScope === 'alltime' ? 'All-Time' : 'Session'"></span>
+                        </div>
+                        <div x-show="voicechatMetricsStateForScope() === 'loading'" x-cloak
+                             class="px-6 py-8 text-center text-sm text-neutral-400">
+                            Loading VoiceChat metrics...
+                        </div>
+                        <div x-show="voicechatMetricsStateForScope() === 'error'" x-cloak
+                             class="px-6 py-8 text-center text-sm text-red-500"
+                             x-text="voicechatMetricsErrorForScope() || 'Unable to load VoiceChat metrics.'"></div>
+                        <div x-show="voicechatMetricsStateForScope() === 'empty'" x-cloak
+                             class="px-6 py-8 text-center text-sm text-neutral-400">
+                            No VoiceChat activity in this scope.
+                        </div>
+                        <div x-show="voicechatMetricsStateForScope() === 'success'" x-cloak class="p-4 sm:p-6 space-y-4">
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Sessions</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="voicechatMetric(voicechatMetricsForScope(), 'sessions_started').toLocaleString()"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope(), 'sessions_completed') + ' completed'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Terminal States</p>
+                                    <p class="text-sm text-neutral-700" x-text="voicechatMetric(voicechatMetricsForScope().session_terminal_states, 'done') + ' done · ' + voicechatMetric(voicechatMetricsForScope().session_terminal_states, 'disconnected') + ' disconnected'"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope().session_terminal_states, 'cancelled') + ' cancelled · ' + voicechatMetric(voicechatMetricsForScope().session_terminal_states, 'error') + ' errors'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Offline STS</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="voicechatMetric(voicechatMetricsForScope().offline_sts, 'requests').toLocaleString()"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope().offline_sts, 'completed') + ' completed · ' + voicechatMetric(voicechatMetricsForScope().offline_sts, 'busy') + ' busy'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Audio Duration</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="voicechatMetric(voicechatMetricsForScope(), 'audio_duration_seconds').toFixed(1) + ' s'"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope(), 'output_audio_duration_seconds').toFixed(1) + ' s output'"></p>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">First Latency</p>
+                                    <p class="text-xs text-neutral-700" x-text="voicechatMetric(voicechatMetricsForScope(), 'first_transcript_latency_seconds').toFixed(2) + ' s transcript'"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope(), 'first_text_latency_seconds').toFixed(2) + ' s text · ' + voicechatMetric(voicechatMetricsForScope(), 'first_audio_latency_seconds').toFixed(2) + ' s audio'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Turn Activity</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="voicechatMetric(voicechatMetricsForScope(), 'turns').toLocaleString()"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope(), 'interruptions') + ' interruptions · ' + voicechatMetric(voicechatMetricsForScope(), 'cancellations') + ' cancellations'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Busy Responses</p>
+                                    <p class="text-2xl font-bold text-neutral-900" x-text="voicechatMetric(voicechatMetricsForScope(), 'busy_responses').toLocaleString()"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope(), 'sessions_busy') + ' realtime · ' + voicechatMetric(voicechatMetricsForScope(), 'offline_busy') + ' offline'"></p>
+                                </div>
+                                <div class="border border-neutral-100 rounded-xl p-4">
+                                    <p class="text-[11px] font-bold uppercase tracking-wider text-neutral-400 mb-2">Tool Outcomes</p>
+                                    <p class="text-sm text-neutral-700" x-text="voicechatMetric(voicechatMetricsForScope().tool_outcomes, 'requested') + ' requested · ' + voicechatMetric(voicechatMetricsForScope().tool_outcomes, 'failed') + ' failed'"></p>
+                                    <p class="text-xs text-neutral-500 mt-1" x-text="voicechatMetric(voicechatMetricsForScope().tool_outcomes, 'parallel_rejected') + ' parallel rejected'"></p>
+                                </div>
                             </div>
                         </div>
                     </div>

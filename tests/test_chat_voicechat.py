@@ -53,6 +53,14 @@ def _section(source: str, start: str, end: str) -> str:
     return source.split(start, 1)[1].split(end, 1)[0]
 
 
+def _voicechat_section(source: str) -> str:
+    return _section(
+        source,
+        "// ===== Realtime VoiceChat operator session =====",
+        "// ===== Realtime microphone transcription =====",
+    )
+
+
 def test_voicechat_controls_are_capability_gated_and_picker_visible():
     source = _template()
 
@@ -62,6 +70,16 @@ def test_voicechat_controls_are_capability_gated_and_picker_visible():
     assert "realtime_voicechat" in source
     assert "t !== 'audio_tts' && t !== 'audio_sts'" in source
     assert "|| isVoiceChat" in source
+
+
+def test_voicechat_uses_task_four_handshake_without_tools_or_start_event():
+    voicechat = _voicechat_section(_template())
+
+    assert "type: 'session.update'" in voicechat
+    assert "api_key: this.getApiKey()" in voicechat
+    assert "type: 'start'" not in voicechat
+    assert "session.tools" not in voicechat
+    assert "activeTools()" not in voicechat
 
 
 def test_voicechat_negotiates_audio_and_cleans_up_microphone():
@@ -79,6 +97,17 @@ def test_voicechat_negotiates_audio_and_cleans_up_microphone():
     assert "getUserMedia" in lifecycle
     assert "getTracks().forEach(t => t.stop())" in lifecycle
     assert "_resampleVoiceChatSamples" in lifecycle
+
+
+def test_voicechat_flushes_audio_worklet_tail_before_transport_stop():
+    voicechat = _voicechat_section(_template())
+
+    assert "this._emit()" in voicechat
+    assert "{ type: 'flush' }" in voicechat
+    assert "{ type: 'flushed' }" in voicechat
+    assert "flushVoiceChatCapture(session)" in voicechat
+    assert "session.flushingCapture" in voicechat
+    assert "await this.flushVoiceChatCapture(session)" in voicechat
 
 
 def test_voicechat_renders_transcript_text_playback_and_interruption():

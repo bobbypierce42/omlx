@@ -6126,7 +6126,6 @@
             outputSampleRate: 22050,
             frameSamples: 1280,
             ready: false,
-            startSent: false,
             updateSent: false,
             receivedAudio: false,
             sentAudio: false,
@@ -6146,6 +6145,10 @@
             playbackActive: false,
             nextPlaybackTime: 0,
             turnCommitted: false,
+            flushResolve: null,
+            flushPromise: null,
+            flushingCapture: false,
+            usingAudioWorklet: false,
             _beforeUnload: () => this.stopVoiceChat({ discard: true }),
         };
         this.voiceChatSession = session;
@@ -6168,11 +6171,7 @@
 
             ws.onopen = () => {
                 if (this.voiceChatSession !== session || session.finalized) return;
-                session.startSent = this.voiceChatSend(session, {
-                    type: 'start',
-                    model: sourceModel,
-                    api_key: this.getApiKey(),
-                });
+                if (!session.updateSent) session.updateSent = this.voiceChatSessionUpdate(session);
             };
             ws.onmessage = (event) => {
                 this.handleVoiceChatMessage(session, event).catch(() => {
@@ -6207,11 +6206,10 @@
         };
         const prompt = String(this.systemPrompt || '').trim();
         if (prompt) sessionConfig.instructions = prompt;
-        const tools = this.activeTools();
-        if (tools.length) sessionConfig.tools = tools;
         return this.voiceChatSend(session, {
             type: 'session.update',
             event_id: this.newVoiceChatEventId('session'),
+            api_key: this.getApiKey(),
             session: sessionConfig,
         });
     },
@@ -6415,19 +6413,32 @@
     _voiceChatWorkletSource() {
         return `
             class OmlxVoiceChatCapture extends AudioWorkletProcessor {
-                constructor() { super(); this._buf = []; this._len = 0; }
+                constructor() {
+                    super();
+                    this._buf = [];
+                    this._len = 0;
+                    this.port.onmessage = (event) => {
+                        if (event.data?.type === 'flush') {
+                            this._emit();
+                            this.port.postMessage({ type: 'flushed' });
+                        }
+                    };
+                }
+                _emit() {
+                    if (!this._len) return;
+                    const out = new Float32Array(this._len);
+                    let offset = 0;
+                    for (const block of this._buf) { out.set(block, offset); offset += block.length; }
+                    this.port.postMessage({ type: 'audio', samples: out }, [out.buffer]);
+                    this._buf = [];
+                    this._len = 0;
+                }
                 process(inputs) {
                     const ch = inputs[0] && inputs[0][0];
                     if (ch) {
                         this._buf.push(new Float32Array(ch));
                         this._len += ch.length;
-                        if (this._len >= 2048) {
-                            const out = new Float32Array(this._len);
-                            let offset = 0;
-                            for (const block of this._buf) { out.set(block, offset); offset += block.length; }
-                            this.port.postMessage(out, [out.buffer]);
-                            this._buf = []; this._len = 0;
-                        }
+                        if (this._len >= 2048) this._emit();
                     }
                     return true;
                 }
@@ -6556,8 +6567,8 @@
         session.captureSource = source;
 
         const handleChunk = (chunk) => {
-            if (session.finalized || session.stopping) return;
-            if (session.playbackActive && this._voiceChatChunkHasSpeech(chunk)) {
+            if (session.finalized || (session.stopping && !session.flushingCapture)) return;
+            if (!session.stopping && session.playbackActive && this._voiceChatChunkHasSpeech(chunk)) {
                 this.interruptVoiceChat(session);
                 return;
             }
@@ -6582,10 +6593,22 @@
                 URL.revokeObjectURL(blobUrl);
             }
             const worklet = new AudioWorkletNode(context, 'omlx-voicechat-capture');
-            worklet.port.onmessage = (event) => handleChunk(event.data);
+            worklet.port.onmessage = (event) => {
+                const message = event.data;
+                if (message?.type === 'flushed') {
+                    const resolve = session.flushResolve;
+                    session.flushResolve = null;
+                    session.flushingCapture = false;
+                    session.flushPromise = null;
+                    if (resolve) resolve();
+                    return;
+                }
+                handleChunk(message?.type === 'audio' ? message.samples : message);
+            };
             source.connect(worklet);
             if (sink) worklet.connect(sink);
             session.workletNode = worklet;
+            session.usingAudioWorklet = true;
             return;
         }
         if (!context.createScriptProcessor) throw new Error('Audio capture unavailable');
@@ -6596,8 +6619,35 @@
         session.workletNode = processor;
     },
 
+    async flushVoiceChatCapture(session) {
+        if (!session?.usingAudioWorklet || !session.workletNode?.port) return;
+        if (session.flushPromise) return session.flushPromise;
+        session.flushingCapture = true;
+        session.flushPromise = new Promise(resolve => {
+            session.flushResolve = () => {
+                session.flushResolve = null;
+                session.flushingCapture = false;
+                session.flushPromise = null;
+                resolve();
+            };
+            try {
+                session.workletNode.port.postMessage({ type: 'flush' });
+            } catch (e) {
+                session.flushResolve();
+            }
+        });
+        return session.flushPromise;
+    },
+
     _stopVoiceChatCapture(session) {
         if (!session) return;
+        if (session.usingAudioWorklet && session.workletNode?.port
+            && !session.stopping && !session.finalized) {
+            try { session.workletNode.port.postMessage({ type: 'flush' }); } catch (e) { }
+        }
+        if (session.flushResolve) {
+            session.flushResolve();
+        }
         if (session.workletNode) {
             try { session.workletNode.disconnect(); } catch (e) { }
             session.workletNode = null;
@@ -6629,7 +6679,8 @@
     },
 
     queueVoiceChatAudio(session, encoded, sampleRate) {
-        if (!session || session.finalized || typeof encoded !== 'string' || !encoded) return;
+        if (!session || session.finalized || session.interrupted
+            || typeof encoded !== 'string' || !encoded) return;
         const context = session.audioContext;
         if (!context) return;
         try {
@@ -6663,7 +6714,7 @@
         }
     },
 
-    interruptVoiceChat(session = this.voiceChatSession) {
+    async interruptVoiceChat(session = this.voiceChatSession) {
         if (!session || session.finalized || session.interruptionSent) return;
         session.interruptionSent = true;
         session.interrupted = true;
@@ -6671,6 +6722,9 @@
         this.voiceChatUiState = 'interrupted';
         this.voiceChatError = '';
         this.stopVoiceChatPlayback(session);
+        await this.flushVoiceChatCapture(session);
+        if (session.finalized) return;
+        this._flushVoiceChatInput(session);
         this._stopVoiceChatCapture(session);
         if (!this.voiceChatSend(session, {
             type: 'response.cancel',
@@ -6685,6 +6739,8 @@
         if (!session || session.stopping) return;
         session.stopping = true;
         this.voiceChatUiState = 'ending';
+        await this.flushVoiceChatCapture(session);
+        if (session.finalized) return;
         this._flushVoiceChatInput(session);
         this._stopVoiceChatCapture(session);
         if (session.ws?.readyState === WebSocket.OPEN && session.sentAudio) {

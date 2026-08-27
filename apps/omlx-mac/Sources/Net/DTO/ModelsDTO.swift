@@ -36,6 +36,16 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Native context window from the model's config.json. The Context
     /// Bench target selector hides presets beyond it.
     let modelContextLength: Int?
+    /// True only for the Nemotron VoiceChat family. The public model type
+    /// remains `audio_sts`; this flag gates the dedicated realtime surface.
+    let realtimeVoicechat: Bool?
+    let inputSampleRate: Int?
+    let outputSampleRate: Int?
+    let frameDurationMs: Int?
+    /// Sticky diagnostic state from the last failed load attempt.
+    let loadFailed: Bool?
+    let loadFailureMessage: String?
+    let loadFailureAt: Double?
     /// Server-side default for `enable_thinking` derived from the model
     /// (chat template, config). UI shows it as the inherited value when
     /// `enable_thinking` is unset and offers a one-click reset to it.

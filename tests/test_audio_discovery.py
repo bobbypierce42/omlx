@@ -11,6 +11,8 @@ All tests run without mlx-audio installed — only config.json parsing is tested
 import json
 from pathlib import Path
 
+import pytest
+
 from omlx.model_discovery import (
     AUDIO_STS_ARCHITECTURES,
     AUDIO_STS_MODEL_TYPES,
@@ -18,6 +20,7 @@ from omlx.model_discovery import (
     detect_model_type,
     discover_models,
     estimate_model_size,
+    is_realtime_voicechat_model,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,68 @@ def _make_model(path: Path, config: dict, size: int = 1000) -> None:
 
 class TestDetectAudioModelType:
     """Tests that audio model types are detected correctly."""
+
+    @pytest.mark.parametrize(
+        ("variant", "quantization"),
+        [
+            ("bf16", {"torch_dtype": "bfloat16"}),
+            ("8bit", {"quantization_config": {"bits": 8}}),
+            ("4bit", {"quantization_config": {"bits": 4}}),
+        ],
+    )
+    def test_nemotron_voicechat_family_metadata(self, tmp_path, variant, quantization):
+        """All supported checkpoint precisions keep the native VoiceChat contract."""
+        model_dir = tmp_path / variant
+        config = {
+            "model_type": "nemotron_voicechat",
+            "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+            "input_sample_rate": 16000,
+            "output_sample_rate": 22050,
+            "frame_duration": 0.08,
+            **quantization,
+        }
+        _make_model(model_dir, config)
+
+        model = discover_models(tmp_path)[variant]
+
+        assert model.model_type == "audio_sts"
+        assert model.engine_type == "voicechat"
+        assert model.is_voicechat is True
+        assert model.input_sample_rate == 16000
+        assert model.output_sample_rate == 22050
+        assert model.frame_duration_ms == 80
+
+    def test_nemotron_voicechat_architecture_is_audio_sts(self, tmp_path):
+        """The known architecture is sufficient even with an unknown root type."""
+        _write_config(tmp_path, {
+            "model_type": "unknown",
+            "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+        })
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_nemotron_voicechat_model_type_does_not_require_known_architecture(
+        self, tmp_path
+    ):
+        """The family marker remains discoverable when the architecture evolves."""
+        _write_config(tmp_path, {
+            "model_type": "nemotron_voicechat",
+            "architectures": ["FutureNemotronVoiceChatArchitecture"],
+        })
+        assert detect_model_type(tmp_path) == "audio_sts"
+
+    def test_unknown_audio_architecture_without_family_marker_defaults_to_llm(
+        self, tmp_path
+    ):
+        _write_config(tmp_path, {
+            "model_type": "unknown",
+            "architectures": ["FutureAudioArchitecture"],
+        })
+        assert detect_model_type(tmp_path) == "llm"
+
+    def test_realtime_voicechat_flag_is_family_scoped(self):
+        assert is_realtime_voicechat_model("audio_sts", "nemotron_voicechat")
+        assert not is_realtime_voicechat_model("audio_sts", "sam_audio")
+        assert not is_realtime_voicechat_model("llm", "nemotron_voicechat")
 
     def test_whisper_architecture_returns_audio_stt(self, tmp_path):
         """WhisperForConditionalGeneration architecture -> audio_stt."""
@@ -279,6 +344,18 @@ class TestNonAudioRegressions:
         })
         result = detect_model_type(tmp_path)
         assert result not in ("audio_stt", "audio_tts")
+
+    def test_nested_voicechat_config_does_not_classify_unrelated_model(self, tmp_path):
+        """Only top-level VoiceChat markers may advertise the family."""
+        _write_config(tmp_path, {
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"],
+            "audio_config": {
+                "model_type": "nemotron_voicechat",
+                "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+            },
+        })
+        assert detect_model_type(tmp_path) == "llm"
 
 
 # ---------------------------------------------------------------------------
@@ -578,4 +655,8 @@ class TestDiscoverModelsIncludesSTS:
         assert model.model_path == str(sts_dir)
         assert model.model_type == "audio_sts"
         assert model.engine_type == "audio_sts"
+        assert model.is_voicechat is False
+        assert model.input_sample_rate is None
+        assert model.output_sample_rate is None
+        assert model.frame_duration_ms is None
         assert model.estimated_size == int(2048 * 1.05)

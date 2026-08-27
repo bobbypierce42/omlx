@@ -432,6 +432,36 @@ class TestEnginePoolErrors:
 class TestEnginePoolStatus:
     """Tests for EnginePool status reporting."""
 
+    def test_get_status_serializes_voicechat_metadata_and_load_failure(self):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries["voicechat"] = EngineEntry(
+            model_id="voicechat",
+            model_path="/models/voicechat",
+            model_type="audio_sts",
+            engine_type="voicechat",
+            estimated_size=1024,
+            config_model_type="nemotron_voicechat",
+            is_voicechat=True,
+            input_sample_rate=16000,
+            output_sample_rate=22050,
+            frame_duration_ms=80,
+            load_failed=True,
+            load_failure_message="VoiceChat engine is not available yet",
+            load_failure_at=123.0,
+        )
+
+        model = pool.get_status()["models"][0]
+
+        assert model["model_type"] == "audio_sts"
+        assert model["engine_type"] == "voicechat"
+        assert model["realtime_voicechat"] is True
+        assert model["input_sample_rate"] == 16000
+        assert model["output_sample_rate"] == 22050
+        assert model["frame_duration_ms"] == 80
+        assert model["load_failed"] is True
+        assert model["load_failure_message"] == "VoiceChat engine is not available yet"
+        assert model["load_failure_at"] == 123.0
+
     def test_get_status(self, small_mock_model_dir):
         """Test get_status returns correct information."""
         pool = _make_pool(ceiling=10 * 1024**3)
@@ -679,6 +709,53 @@ class TestApplySettingsOverrides:
 
         assert pool.get_entry("model-a").model_type == "llm"
         assert pool.get_entry("model-a").engine_type == "batched"
+
+    def test_audio_sts_override_keeps_voicechat_engine(self):
+        """VoiceChat uses the existing audio_sts override without losing routing."""
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool()
+        pool._entries["voicechat"] = EngineEntry(
+            model_id="voicechat",
+            model_path="/models/voicechat",
+            model_type="audio_sts",
+            engine_type="voicechat",
+            estimated_size=1,
+            config_model_type="nemotron_voicechat",
+            is_voicechat=True,
+        )
+        settings_manager = MagicMock()
+        settings_manager.get_settings.return_value = ModelSettings(
+            model_type_override="audio_sts"
+        )
+
+        pool.apply_settings_overrides(settings_manager)
+
+        entry = pool.get_entry("voicechat")
+        assert entry.model_type == "audio_sts"
+        assert entry.engine_type == "voicechat"
+
+    @pytest.mark.asyncio
+    async def test_voicechat_load_fails_closed_without_generic_engine(self, tmp_path):
+        model_dir = tmp_path / "voicechat"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({
+            "model_type": "nemotron_voicechat",
+            "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+        }))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 100)
+        pool = _make_pool()
+        pool.discover_models(str(tmp_path))
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine") as batched,
+            pytest.raises(ModelUnavailableError, match="VoiceChat engine"),
+        ):
+            await pool.get_engine("voicechat")
+
+        batched.assert_not_called()
+        entry = pool.get_entry("voicechat")
+        assert entry.load_failed is True
 
 
 class TestVLMFallback:

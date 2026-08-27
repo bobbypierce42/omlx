@@ -19,6 +19,51 @@ import omlx.admin.routes as admin_routes
 class TestListModelsSettings:
     """Tests for list_models() settings completeness."""
 
+    def test_list_models_preserves_voicechat_status_metadata(self):
+        mock_engine_pool = MagicMock()
+        mock_engine_pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "voicechat",
+                    "loaded": False,
+                    "estimated_size": 1000,
+                    "pinned": False,
+                    "engine_type": "voicechat",
+                    "model_type": "audio_sts",
+                    "realtime_voicechat": True,
+                    "input_sample_rate": 16000,
+                    "output_sample_rate": 22050,
+                    "frame_duration_ms": 80,
+                    "load_failed": True,
+                    "load_failure_message": "VoiceChat engine is not available yet",
+                    "load_failure_at": 123.0,
+                }
+            ]
+        }
+        mock_settings_manager = MagicMock()
+        mock_settings_manager.get_all_settings.return_value = {}
+        mock_server_state = MagicMock()
+        mock_server_state.default_model = None
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=mock_engine_pool),
+            patch.object(
+                admin_routes, "_get_settings_manager", return_value=mock_settings_manager
+            ),
+            patch.object(admin_routes, "_get_server_state", return_value=mock_server_state),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["engine_type"] == "voicechat"
+        assert model["realtime_voicechat"] is True
+        assert model["input_sample_rate"] == 16000
+        assert model["output_sample_rate"] == 22050
+        assert model["frame_duration_ms"] == 80
+        assert model["load_failed"] is True
+        assert model["load_failure_message"] == "VoiceChat engine is not available yet"
+        assert model["load_failure_at"] == 123.0
+
     def test_list_models_includes_all_model_settings_fields(self):
         """Ensure list_models response includes all ModelSettings fields."""
         mock_engine_pool = MagicMock()

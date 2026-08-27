@@ -49,7 +49,16 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
-from .model_discovery import discover_models, format_size, is_realtime_stt_model
+from .model_discovery import (
+    VOICECHAT_CAPABILITY,
+    VOICECHAT_FRAME_DURATION_MS,
+    VOICECHAT_INPUT_SAMPLE_RATE,
+    VOICECHAT_OUTPUT_SAMPLE_RATE,
+    discover_models,
+    format_size,
+    is_realtime_stt_model,
+    is_realtime_voicechat_model,
+)
 from .scheduler import SchedulerConfig
 from .utils.proc_memory import get_phys_footprint
 
@@ -195,6 +204,7 @@ class EngineEntry:
         "audio_stt",
         "audio_tts",
         "audio_sts",
+        "voicechat",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -215,6 +225,10 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    is_voicechat: bool = False  # Nemotron VoiceChat family marker
+    input_sample_rate: int | None = None
+    output_sample_rate: int | None = None
+    frame_duration_ms: int | None = None
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -240,6 +254,29 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+
+
+def _voicechat_status_fields(entry: EngineEntry) -> dict[str, object]:
+    """Return VoiceChat capability metadata for a pool status row."""
+    realtime = entry.model_type == "audio_sts" and (
+        entry.is_voicechat
+        or is_realtime_voicechat_model(
+            entry.model_type, entry.config_model_type, entry.engine_type
+        )
+    )
+    if not realtime:
+        return {
+            VOICECHAT_CAPABILITY: False,
+            "input_sample_rate": None,
+            "output_sample_rate": None,
+            "frame_duration_ms": None,
+        }
+    return {
+        VOICECHAT_CAPABILITY: True,
+        "input_sample_rate": entry.input_sample_rate or VOICECHAT_INPUT_SAMPLE_RATE,
+        "output_sample_rate": entry.output_sample_rate or VOICECHAT_OUTPUT_SAMPLE_RATE,
+        "frame_duration_ms": entry.frame_duration_ms or VOICECHAT_FRAME_DURATION_MS,
+    }
 
 
 class EnginePool:
@@ -734,6 +771,10 @@ class EnginePool:
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
+                    is_voicechat=getattr(info, "is_voicechat", False),
+                    input_sample_rate=getattr(info, "input_sample_rate", None),
+                    output_sample_rate=getattr(info, "output_sample_rate", None),
+                    frame_duration_ms=getattr(info, "frame_duration_ms", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -772,6 +813,14 @@ class EnginePool:
     }
 
     @staticmethod
+    def _engine_type_for_model_type(model_type: str, entry: EngineEntry) -> str:
+        if model_type == "audio_sts" and (
+            entry.is_voicechat or entry.engine_type == "voicechat"
+        ):
+            return "voicechat"
+        return EnginePool._MODEL_TYPE_TO_ENGINE.get(model_type, "batched")
+
+    @staticmethod
     def _entry_is_diffusion_model(entry: EngineEntry) -> bool:
         model_type = (entry.config_model_type or "").lower().replace("-", "_")
         return model_type == "diffusion_gemma"
@@ -784,8 +833,8 @@ class EnginePool:
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
                 entry.model_type = settings.model_type_override
-                entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
-                    settings.model_type_override, "batched"
+                entry.engine_type = self._engine_type_for_model_type(
+                    settings.model_type_override, entry
                 )
                 logger.info(
                     f"Applied model_type override for {model_id}: "
@@ -2501,7 +2550,13 @@ class EnginePool:
             if deployment is None and model_settings is not None:
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if (
+                if dflash_enabled and dflash_draft and effective_type == "voicechat":
+                    logger.warning(
+                        "DFlash is not supported for VoiceChat; "
+                        "leaving %s on its dedicated engine path",
+                        model_id,
+                    )
+                elif (
                     dflash_enabled
                     and dflash_draft
                     and self._entry_is_diffusion_model(entry)
@@ -2613,6 +2668,13 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
+                    )
+                # The family is discoverable before the dedicated engine lands;
+                # fail closed instead of routing a VoiceChat checkpoint to text.
+                elif effective_type == "voicechat":
+                    raise ModelUnavailableError(
+                        model_id,
+                        "VoiceChat engine is not available",
                     )
                 elif entry.engine_type == "audio_stt":
                     engine = STTEngine(model_name=entry.model_path)
@@ -3018,6 +3080,10 @@ class EnginePool:
                     "realtime_stt": is_realtime_stt_model(
                         e.model_type, e.config_model_type
                     ),
+                    **_voicechat_status_fields(e),
+                    "load_failed": e.load_failed,
+                    "load_failure_message": e.load_failure_message,
+                    "load_failure_at": e.load_failure_at,
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,

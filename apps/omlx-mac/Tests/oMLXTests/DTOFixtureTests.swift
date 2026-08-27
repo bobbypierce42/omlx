@@ -128,6 +128,22 @@ final class DTOFixtureTests: XCTestCase {
         }
     }
 
+    func testVoicechatModelStatusFieldsDecode() throws {
+        let data = Data(
+            #"{"id":"voicechat","loaded":false,"is_loading":false,"estimated_size":1,"realtime_voicechat":true,"input_sample_rate":16000,"output_sample_rate":22050,"frame_duration_ms":80,"load_failed":true,"load_failure_message":"VoiceChat engine is not available","load_failure_at":123.0}"#.utf8
+        )
+
+        let model = try Self.makeDecoder().decode(ModelDTO.self, from: data)
+
+        XCTAssertEqual(model.realtimeVoicechat, true)
+        XCTAssertEqual(model.inputSampleRate, 16000)
+        XCTAssertEqual(model.outputSampleRate, 22050)
+        XCTAssertEqual(model.frameDurationMs, 80)
+        XCTAssertEqual(model.loadFailed, true)
+        XCTAssertEqual(model.loadFailureMessage, "VoiceChat engine is not available")
+        XCTAssertEqual(model.loadFailureAt, 123.0)
+    }
+
     // MARK: - Profile list (per-model)
 
     func testModelProfilesFixtureDecodes() throws {

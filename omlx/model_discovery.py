@@ -12,6 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
+- Audio STS models: Use STSEngine for speech-to-speech processing
 """
 
 import contextlib
@@ -25,8 +26,19 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"
+]
+EngineType = Literal[
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "voicechat",
+]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -270,6 +282,13 @@ UNSUPPORTED_ARCHITECTURES: set[str] = set()
 
 _LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense"}
 
+VOICECHAT_MODEL_TYPE = "nemotron_voicechat"
+VOICECHAT_ARCHITECTURE = "NemotronVoiceChatForConditionalGeneration"
+VOICECHAT_CAPABILITY = "realtime_voicechat"
+VOICECHAT_INPUT_SAMPLE_RATE = 16_000
+VOICECHAT_OUTPUT_SAMPLE_RATE = 22_050
+VOICECHAT_FRAME_DURATION_MS = 80
+
 
 def _build_audio_detection_sets():
     """Build STT/TTS/STS model-type sets from mlx-audio at import time.
@@ -324,6 +343,7 @@ def _build_audio_detection_sets():
 AUDIO_STT_MODEL_TYPES, AUDIO_TTS_MODEL_TYPES, AUDIO_STS_MODEL_TYPES = (
     _build_audio_detection_sets()
 )
+AUDIO_STS_MODEL_TYPES.add(VOICECHAT_MODEL_TYPE)
 
 # Architecture-based detection — these are checked before model_type and
 # are always static because architecture strings are stable identifiers.
@@ -348,6 +368,7 @@ AUDIO_STS_ARCHITECTURES = {
     "MossFormer2SEModel",
     "SAMAudio",
     "LFM2AudioModel",
+    VOICECHAT_ARCHITECTURE,
 }
 
 # STT families whose mlx-audio implementations accept incremental audio
@@ -364,14 +385,50 @@ def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
     return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
 
 
+def _is_voicechat_config(config: dict) -> bool:
+    """True when top-level config markers identify Nemotron VoiceChat."""
+    if not isinstance(config, dict):
+        return False
+
+    model_type = config.get("model_type")
+    if (
+        isinstance(model_type, str)
+        and model_type.lower().replace("-", "_") == VOICECHAT_MODEL_TYPE
+    ):
+        return True
+
+    architectures = config.get("architectures") or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if not isinstance(architectures, (list, tuple, set)):
+        return False
+    return VOICECHAT_ARCHITECTURE in architectures
+
+
+def is_realtime_voicechat_model(
+    model_type: str,
+    config_model_type: str = "",
+    engine_type: str | None = None,
+) -> bool:
+    """True when an audio STS model has the realtime VoiceChat capability."""
+    if model_type != "audio_sts":
+        return False
+    if engine_type == "voicechat":
+        return True
+    return (
+        isinstance(config_model_type, str)
+        and config_model_type.lower().replace("-", "_") == VOICECHAT_MODEL_TYPE
+    )
+
+
 @dataclass
 class DiscoveredModel:
     """Information about a discovered model."""
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: ModelType  # "llm", "vlm", "embedding", or "reranker"
-    engine_type: EngineType  # "batched", "vlm", "embedding", or "reranker"
+    model_type: ModelType  # Public model category
+    engine_type: EngineType  # Runtime engine, including dedicated VoiceChat
     estimated_size: int  # Estimated memory usage in bytes
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
@@ -381,6 +438,10 @@ class DiscoveredModel:
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    is_voicechat: bool = False  # Nemotron VoiceChat family marker
+    input_sample_rate: int | None = None  # Native VoiceChat input rate in Hz
+    output_sample_rate: int | None = None  # Native VoiceChat output rate in Hz
+    frame_duration_ms: int | None = None  # Native VoiceChat frame duration
 
 
 @dataclass(frozen=True)
@@ -735,6 +796,11 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Only top-level architectures/model_type are inspected; nested audio_config
     # inside multimodal models (e.g., MiniCPM-o) does not trigger this path.
     #
+    # Nemotron VoiceChat is a dedicated STS family even though its implementation
+    # is supplied by mlx-vlm rather than mlx-audio.
+    if _is_voicechat_config(config):
+        return "audio_sts"
+
     # Architecture check first (unambiguous):
     for arch in architectures:
         if arch in AUDIO_STT_ARCHITECTURES:
@@ -1464,8 +1530,23 @@ def _register_model(
             )
             return
 
+        config_model_type = ""
+        is_helper = False
+        try:
+            with open(model_dir / "config.json") as f:
+                _config = json.load(f)
+            config_model_type = _config.get("model_type", "")
+            if not isinstance(config_model_type, str):
+                config_model_type = ""
+            is_helper = is_helper_model_config(_config)
+        except Exception:
+            _config = {}
+
         model_type = detect_model_type(model_dir)
-        if model_type == "embedding":
+        is_voicechat = model_type == "audio_sts" and _is_voicechat_config(_config)
+        if is_voicechat:
+            engine_type: EngineType = "voicechat"
+        elif model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
@@ -1483,19 +1564,6 @@ def _register_model(
         text_only_size = (
             estimate_text_only_model_size(model_dir) if model_type == "vlm" else 0
         )
-
-        # Read raw config model_type for sub-type detection (e.g., OCR models)
-        # and flag speculative-decoding drafters (dFlash/Assistant/MTP).
-        config_model_type = ""
-        is_helper = False
-        try:
-            import json
-            with open(model_dir / "config.json") as f:
-                _config = json.load(f)
-            config_model_type = _config.get("model_type", "")
-            is_helper = is_helper_model_config(_config)
-        except Exception:
-            pass
 
         thinking_default = detect_thinking_default(model_dir)
         preserve_thinking_default = detect_preserve_thinking(model_dir)
@@ -1515,6 +1583,14 @@ def _register_model(
             source_type=source_type,
             source_repo_id=source_repo_id,
             is_helper=is_helper,
+            is_voicechat=is_voicechat,
+            input_sample_rate=(
+                VOICECHAT_INPUT_SAMPLE_RATE if is_voicechat else None
+            ),
+            output_sample_rate=(
+                VOICECHAT_OUTPUT_SAMPLE_RATE if is_voicechat else None
+            ),
+            frame_duration_ms=(VOICECHAT_FRAME_DURATION_MS if is_voicechat else None),
         )
 
         size_gb = estimated_size / (1024**3)

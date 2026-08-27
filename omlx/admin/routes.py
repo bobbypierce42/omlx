@@ -1949,6 +1949,13 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "realtime_voicechat": model_info.get("realtime_voicechat", False),
+            "input_sample_rate": model_info.get("input_sample_rate"),
+            "output_sample_rate": model_info.get("output_sample_rate"),
+            "frame_duration_ms": model_info.get("frame_duration_ms"),
+            "load_failed": model_info.get("load_failed", False),
+            "load_failure_message": model_info.get("load_failure_message"),
+            "load_failure_at": model_info.get("load_failure_at"),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),
@@ -2249,7 +2256,15 @@ async def update_model_settings(
         }
         if override_value:
             entry.model_type = override_value
-            entry.engine_type = type_to_engine.get(override_value, "batched")
+            voicechat_family = (
+                getattr(entry, "is_voicechat", False) is True
+                or entry.engine_type == "voicechat"
+            )
+            entry.engine_type = (
+                "voicechat"
+                if override_value == "audio_sts" and voicechat_family
+                else type_to_engine.get(override_value, "batched")
+            )
         else:
             # Reset to auto-detected type
             from pathlib import Path
@@ -2258,7 +2273,15 @@ async def update_model_settings(
 
             detected_type = detect_model_type(Path(entry.model_path))
             entry.model_type = detected_type
-            entry.engine_type = type_to_engine.get(detected_type, "batched")
+            entry.engine_type = (
+                "voicechat"
+                if detected_type == "audio_sts"
+                and (
+                    getattr(entry, "is_voicechat", False) is True
+                    or entry.engine_type == "voicechat"
+                )
+                else type_to_engine.get(detected_type, "batched")
+            )
     if "max_context_window" in sent:
         current_settings.max_context_window = request.max_context_window
     if "max_tokens" in sent:

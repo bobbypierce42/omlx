@@ -1953,6 +1953,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "input_sample_rate": model_info.get("input_sample_rate"),
             "output_sample_rate": model_info.get("output_sample_rate"),
             "frame_duration_ms": model_info.get("frame_duration_ms"),
+            "voicechat_status": model_info.get("voicechat_status"),
             "load_failed": model_info.get("load_failed", False),
             "load_failure_message": model_info.get("load_failure_message"),
             "load_failure_at": model_info.get("load_failure_at"),

@@ -736,7 +736,7 @@ class TestApplySettingsOverrides:
         assert entry.engine_type == "voicechat"
 
     @pytest.mark.asyncio
-    async def test_voicechat_load_fails_closed_without_generic_engine(self, tmp_path):
+    async def test_voicechat_load_uses_dedicated_engine(self, tmp_path):
         model_dir = tmp_path / "voicechat"
         model_dir.mkdir()
         (model_dir / "config.json").write_text(json.dumps({
@@ -747,15 +747,18 @@ class TestApplySettingsOverrides:
         pool = _make_pool()
         pool.discover_models(str(tmp_path))
 
+        voicechat = MagicMock()
+        voicechat.start = AsyncMock()
         with (
             patch("omlx.engine_pool.BatchedEngine") as batched,
-            pytest.raises(ModelUnavailableError, match="VoiceChat engine"),
+            patch("omlx.engine_pool.VoiceChatEngine", return_value=voicechat),
         ):
-            await pool.get_engine("voicechat")
+            engine = await pool.get_engine("voicechat")
 
         batched.assert_not_called()
-        entry = pool.get_entry("voicechat")
-        assert entry.load_failed is True
+        assert engine is voicechat
+        voicechat.start.assert_awaited_once()
+        assert pool.get_entry("voicechat").load_failed is False
 
 
 class TestVLMFallback:

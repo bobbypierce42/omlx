@@ -34,6 +34,7 @@ class TestListModelsSettings:
                     "input_sample_rate": 16000,
                     "output_sample_rate": 22050,
                     "frame_duration_ms": 80,
+                    "voicechat_status": "failed",
                     "load_failed": True,
                     "load_failure_message": "VoiceChat engine is not available yet",
                     "load_failure_at": 123.0,
@@ -60,6 +61,7 @@ class TestListModelsSettings:
         assert model["input_sample_rate"] == 16000
         assert model["output_sample_rate"] == 22050
         assert model["frame_duration_ms"] == 80
+        assert model["voicechat_status"] == "failed"
         assert model["load_failed"] is True
         assert model["load_failure_message"] == "VoiceChat engine is not available yet"
         assert model["load_failure_at"] == 123.0

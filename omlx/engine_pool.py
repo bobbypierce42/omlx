@@ -38,6 +38,7 @@ from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
+from .engine.voicechat import VoiceChatEngine, VoiceChatStatus
 from .engine_core import get_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
@@ -236,6 +237,7 @@ class EngineEntry:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | VoiceChatEngine
         | None
     ) = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
@@ -270,12 +272,29 @@ def _voicechat_status_fields(entry: EngineEntry) -> dict[str, object]:
             "input_sample_rate": None,
             "output_sample_rate": None,
             "frame_duration_ms": None,
+            "voicechat_status": None,
         }
+    if entry.load_failed:
+        status = VoiceChatStatus.FAILED.value
+    elif entry.is_loading:
+        status = VoiceChatStatus.LOADING.value
+    elif entry.engine is None:
+        status = VoiceChatStatus.UNLOADED.value
+    else:
+        engine_status = getattr(entry.engine, "get_status", None)
+        try:
+            details = engine_status() if callable(engine_status) else {}
+        except Exception:
+            details = {}
+        status = details.get("status") if isinstance(details, dict) else None
+        if status not in {item.value for item in VoiceChatStatus}:
+            status = VoiceChatStatus.QUEUED.value
     return {
         VOICECHAT_CAPABILITY: True,
         "input_sample_rate": entry.input_sample_rate or VOICECHAT_INPUT_SAMPLE_RATE,
         "output_sample_rate": entry.output_sample_rate or VOICECHAT_OUTPUT_SAMPLE_RATE,
         "frame_duration_ms": entry.frame_duration_ms or VOICECHAT_FRAME_DURATION_MS,
+        "voicechat_status": status,
     }
 
 
@@ -1431,6 +1450,7 @@ class EnginePool:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | VoiceChatEngine
     ):
         """
         Get or load engine for the specified model.
@@ -2669,12 +2689,18 @@ class EnginePool:
                         model_settings=model_settings,
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
-                # The family is discoverable before the dedicated engine lands;
-                # fail closed instead of routing a VoiceChat checkpoint to text.
                 elif effective_type == "voicechat":
-                    raise ModelUnavailableError(
-                        model_id,
-                        "VoiceChat engine is not available",
+                    engine = VoiceChatEngine(
+                        model_name=entry.model_path,
+                        input_sample_rate=(
+                            entry.input_sample_rate or VOICECHAT_INPUT_SAMPLE_RATE
+                        ),
+                        output_sample_rate=(
+                            entry.output_sample_rate or VOICECHAT_OUTPUT_SAMPLE_RATE
+                        ),
+                        frame_duration_ms=(
+                            entry.frame_duration_ms or VOICECHAT_FRAME_DURATION_MS
+                        ),
                     )
                 elif entry.engine_type == "audio_stt":
                     engine = STTEngine(model_name=entry.model_path)

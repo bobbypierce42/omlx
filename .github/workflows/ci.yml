@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, macOS, ARM64, kalana-macos-ci]
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'macos-26' || 'kalana-macos-ci' }}
     strategy:
       fail-fast: false
       matrix:

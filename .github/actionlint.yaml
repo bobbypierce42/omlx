@@ -1,0 +1,2 @@
+self-hosted-runner:
+  labels: [kalana-ci, kalana-macos-ci]

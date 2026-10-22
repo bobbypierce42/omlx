@@ -15,16 +15,38 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: [self-hosted, macOS, ARM64, kalana-macos-ci]
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
+      - name: Prepare a private home for the Mac job
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |-
+          mkdir -p "$RUNNER_TEMP/ci-home"
+          echo "HOME=$RUNNER_TEMP/ci-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Set up job-local Python on the Mac runner
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+        with:
+          version: 0.13.0
+          python-version: ${{ matrix.python-version }}
+          activate-environment: true
+          venv-path: ${{ runner.temp }}/ci-python
+          no-project: true
+          enable-cache: true
+          cache-python: true
+      - name: Provide pip in the Mac Python environment
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        shell: bash
+        run: uv pip install --python "$VIRTUAL_ENV/bin/python" pip
       - name: Set up Python ${{ matrix.python-version }}
+        if: runner.os != 'macOS' || runner.environment != 'self-hosted'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}

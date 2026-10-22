@@ -41,6 +41,12 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
+      - name: Prepare a private home for the Mac job
+        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
+        shell: bash
+        run: |-
+          mkdir -p "$RUNNER_TEMP/ci-home"
+          echo "HOME=$RUNNER_TEMP/ci-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up job-local Python on the Mac runner

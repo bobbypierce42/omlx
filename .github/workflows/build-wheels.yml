@@ -9,19 +9,21 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: native-wheels-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-wheels:
-    # macos-15: the native kernels target MACOSX_DEPLOYMENT_TARGET=15.0, so
-    # the post-build import smoke test needs a Sequoia host.
-    runs-on: macos-15
+    # MLX and native Metal kernels require Apple Silicon and macOS 15+.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, kalana-macos-ci, macOS, ARM64]
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -30,11 +32,24 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - name: Set up isolated Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
         with:
+          version: 0.13.0
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          activate-environment: true
+          venv-path: ${{ runner.temp }}/wheel-build-python
+          no-project: true
+          enable-cache: true
+      - run: uv pip install --python "$VIRTUAL_ENV/bin/python" pip
+
+      - name: Check native build requirements
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 15
+          xcrun --find metal
+          xcrun --find metallib
 
       - name: Build wheel with native custom kernels
         env:
@@ -50,15 +65,17 @@ jobs:
           python -m build --wheel --no-isolation
 
       - name: Smoke-test wheel (native kernels must import and report available)
+        env:
+          WHEEL_SMOKE: ${{ runner.temp }}/wheel-smoke-py${{ matrix.python-version }}
         run: |
           echo "--- native artifacts in the wheel:"
           unzip -l dist/*.whl | grep -E "_ext|dylib|metallib" || { echo "no native artifacts in wheel"; exit 1; }
-          python -m venv /tmp/wheel-smoke
-          /tmp/wheel-smoke/bin/pip install --quiet dist/*.whl
+          python -m venv "$WHEEL_SMOKE"
+          "$WHEEL_SMOKE/bin/pip" install --quiet dist/*.whl
           # run from outside the checkout so `import omlx` resolves to the
           # installed wheel, not the source tree in cwd
-          cd /tmp
-          /tmp/wheel-smoke/bin/python - <<'PY'
+          cd "$RUNNER_TEMP"
+          "$WHEEL_SMOKE/bin/python" - <<'PY'
           import importlib
           failed = []
           for pkg in ("bonsai", "glm_moe_dsa", "minimax_m3", "qwen35_prefill"):
@@ -80,16 +97,34 @@ jobs:
   attach-to-release:
     if: github.event_name == 'release'
     needs: build-wheels
-    runs-on: kalana-ci
+    runs-on: [self-hosted, kalana-ci, Linux]
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
-      - name: Install runner command-line dependencies
+      - name: Set up GitHub CLI without root privileges
         if: runner.os == 'Linux' && runner.environment == 'self-hosted'
         shell: bash
-        run: |-
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gh
+        run: |
+          set -euo pipefail
+          if command -v gh >/dev/null 2>&1; then
+            gh --version
+            exit 0
+          fi
+          case "$(uname -m)" in
+            x86_64) cli_arch=amd64 ;;
+            aarch64|arm64) cli_arch=arm64 ;;
+            *) echo "::error::Unsupported GitHub CLI architecture"; exit 1 ;;
+          esac
+          cli_version=2.103.0
+          cli_package="gh_${cli_version}_linux_${cli_arch}.tar.gz"
+          cli_dir="$(mktemp -d "$RUNNER_TEMP/gh-cli.XXXXXX")"
+          cli_url="https://github.com/cli/cli/releases/download/v${cli_version}"
+          curl -fsSL --retry 3 "$cli_url/$cli_package" -o "$cli_dir/$cli_package"
+          curl -fsSL --retry 3 "$cli_url/gh_${cli_version}_checksums.txt" -o "$cli_dir/checksums.txt"
+          (cd "$cli_dir" && sha256sum --check --ignore-missing checksums.txt)
+          tar -xzf "$cli_dir/$cli_package" -C "$cli_dir"
+          echo "$cli_dir/gh_${cli_version}_linux_${cli_arch}/bin" >> "$GITHUB_PATH"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist

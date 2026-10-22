@@ -14,20 +14,33 @@ permissions:
   contents: read
 
 jobs:
+  static:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, kalana-ci, Linux]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "ruff==0.17.2"
+      - name: Check Python syntax and invalid control flow
+        run: ruff check omlx tests --select E9,F63,F7,F82
+
+  native-wheels:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    uses: ./.github/workflows/build-wheels.yml
+
   test:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'macos-26' || 'kalana-macos-ci' }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, kalana-macos-ci, macOS]
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
-      - name: Prepare a private home for the Mac job
-        if: runner.os == 'macOS' && runner.environment == 'self-hosted'
-        shell: bash
-        run: |-
-          mkdir -p "$RUNNER_TEMP/ci-home"
-          echo "HOME=$RUNNER_TEMP/ci-home" >> "$GITHUB_ENV"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up job-local Python on the Mac runner
@@ -59,4 +72,11 @@ jobs:
           python -m pip install pytest pytest-asyncio
 
       - name: Run unit tests
-        run: python -m pytest tests/ -m "not slow and not integration"
+        run: python -m pytest tests/ -m "not slow and not integration" --junitxml=test-results/pytest.xml
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-tests-py${{ matrix.python-version }}
+          path: test-results/*.xml

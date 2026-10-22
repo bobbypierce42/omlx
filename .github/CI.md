@@ -1,6 +1,6 @@
 # CI
 
-General static checks and release metadata jobs use `[self-hosted, kalana-ci, Linux]`.
+General static checks and release metadata jobs use `kalana-ci`.
 MLX unit tests use `[self-hosted, kalana-macos-ci, macOS]`. Native Metal wheel builds
 also require the automatic `ARM64` label, macOS 15 or later, and an Xcode Metal
 toolchain (`xcrun metal` and `xcrun metallib`). The wheel build checks these

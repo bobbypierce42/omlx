@@ -26,7 +26,7 @@ jobs:
   attach-to-release:
     if: github.event_name == 'release'
     needs: build-wheels
-    runs-on: [self-hosted, kalana-ci, Linux]
+    runs-on: kalana-ci
     timeout-minutes: 30
     permissions:
       contents: write

@@ -1,0 +1,54 @@
+name: Mac runner repository coverage verification
+on:
+  push:
+    branches: [ci/macos-coverage-verification-20261022]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: [self-hosted, macOS, ARM64, kalana-macos-ci]
+    timeout-minutes: 10
+    steps:
+      - name: Verify repository assignment and native Apple tools
+        shell: bash
+        env:
+          EXPECTED_REPOSITORY: bobbypierce42/omlx
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_REPOSITORY"
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          case "$RUNNER_NAME" in kalana-macos-ci-*) ;; *) exit 1 ;; esac
+          mkdir -p "$RUNNER_TEMP/coverage-home"
+          export HOME="$RUNNER_TEMP/coverage-home"
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+          cat > "$RUNNER_TEMP/RunnerProbe.swift" <<'SWIFT'
+          import SwiftUI
+          @main struct Probe {
+            static func main() {
+              let _ = Text("kalana-macos-ci")
+              precondition(2 + 2 == 4)
+              print("KALANA_MACOS_COVERAGE_OK")
+            }
+          }
+          SWIFT
+          xcrun swiftc -parse-as-library -framework SwiftUI \
+            "$RUNNER_TEMP/RunnerProbe.swift" -o "$RUNNER_TEMP/RunnerProbe"
+          codesign --force --sign - "$RUNNER_TEMP/RunnerProbe"
+          codesign --verify --strict "$RUNNER_TEMP/RunnerProbe"
+          "$RUNNER_TEMP/RunnerProbe"
+          printf 'Repository=%s Runner=%s\n' "$GITHUB_REPOSITORY" "$RUNNER_NAME"
+          mkdir -p "$RUNNER_TEMP/NativeTests/Tests/NativeTestsTests"
+          cat > "$RUNNER_TEMP/NativeTests/Package.swift" <<'SWIFT'
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(name: "NativeTests", targets: [.testTarget(name: "NativeTestsTests")])
+          SWIFT
+          cat > "$RUNNER_TEMP/NativeTests/Tests/NativeTestsTests/ProbeTests.swift" <<'SWIFT'
+          import XCTest
+          final class ProbeTests: XCTestCase {
+            func testNativeRunner() { XCTAssertEqual(2 + 2, 4) }
+          }
+          SWIFT
+          swift test --jobs 2 --package-path "$RUNNER_TEMP/NativeTests"

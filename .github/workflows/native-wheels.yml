@@ -45,8 +45,33 @@ jobs:
         run: |
           test "$(uname -m)" = arm64
           test "$(sw_vers -productVersion | cut -d. -f1)" -ge 15
-          xcrun --find metal
-          xcrun --find metallib
+          xcodebuild -version
+          xcrun -sdk macosx --show-sdk-version
+          metal_probe="$(mktemp -d "$RUNNER_TEMP/metal-probe.XXXXXX")"
+          trap 'rm -rf "$metal_probe"' EXIT
+          cat > "$metal_probe/probe.metal" <<'METAL'
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void ci_probe(device float* output [[buffer(0)]],
+                               uint index [[thread_position_in_grid]]) {
+              output[index] = 1.0f;
+          }
+          METAL
+          compile_and_link_metal() {
+            # The checked-in CMake builds use the metal driver for both phases;
+            # recent Xcode toolchains need no separate metallib executable.
+            xcrun -sdk macosx metal -mmacosx-version-min=15.0 \
+              -c "$metal_probe/probe.metal" -o "$metal_probe/probe.air" &&
+            xcrun -sdk macosx metal -mmacosx-version-min=15.0 \
+              "$metal_probe/probe.air" -o "$metal_probe/probe.metallib" &&
+            test -s "$metal_probe/probe.metallib"
+          }
+          if ! compile_and_link_metal; then
+            # Xcode distributes Metal as an optional component on newer hosts.
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun --kill-cache
+            compile_and_link_metal
+          fi
 
       - name: Build wheel with native custom kernels
         env:

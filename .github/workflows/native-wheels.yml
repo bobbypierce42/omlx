@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
@@ -76,6 +77,7 @@ jobs:
       - name: Build wheel with native custom kernels
         env:
           OMLX_WITH_CUSTOM_KERNEL: "1"
+          CMAKE_BUILD_PARALLEL_LEVEL: "1"
         # --no-isolation with preinstalled build deps: CMake's Python discovery
         # does not reliably resolve pip's isolated build env on the hosted
         # runners (it found the system framework Python without nanobind), so
